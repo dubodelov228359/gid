@@ -307,3 +307,26 @@ a { color: var(--accent); }
 .toast { display: flex; align-items: center; gap: 12px; }
 .toast button { border: 0; background: transparent; color: #8fb4ff; font: inherit; font-weight: 700; padding: 4px; flex: none; }
 .toast { width: max-content; max-width: calc(100vw - 32px); }
+
+/* ---------- Подсказки при вводе ---------- */
+.ac-field { position: relative; flex: 1; min-width: 0; }
+.ac-field .input { width: 100%; }
+.ac-field .input.picked { border-color: var(--success); padding-right: 36px; }
+.ac-field .ok { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: var(--success); font-weight: 700; }
+.ac:empty { display: none; }
+.ac { background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); margin: -2px 0 10px; overflow: hidden; }
+.ac-item { display: flex; flex-direction: column; align-items: flex-start; width: 100%; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; text-align: left; padding: 10px 14px; }
+.ac-item:last-child { border-bottom: 0; }
+.ac-item span { font-size: 13px; color: var(--muted); }
+.ac-item.more { color: var(--accent); font-size: 14px; }
+.ac-item:active { background: var(--chip); }
+.ac-empty { padding: 10px 14px; color: var(--muted); font-size: 14px; }
+
+/* ---------- Широкий экран (компьютер): как телефон, по центру ---------- */
+@media (min-width: 700px) {
+  #app { max-width: 640px; margin: 0 auto; border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+  .sheet { max-width: 640px; margin: 0 auto; }
+  .backdrop { justify-content: center; }
+  .sheet.full { border-radius: 0; }
+  .banner { max-width: 616px; left: 50%; right: auto; width: calc(100% - 24px); transform: translateX(-50%); }
+}

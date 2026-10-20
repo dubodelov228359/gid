@@ -3,6 +3,7 @@ import { CATEGORIES, isClosed, distance, formatDistance, walkingMinutes, humanDa
 import { makePlan, ticketReminders } from './planner.js';
 import * as Places from './places.js';
 import * as AI from './ai.js';
+import * as Suggest from './suggest.js';
 import { createMap, addPins, fitTo, userDot, drawRoute, bboxAround, downloadOffline } from './map.js';
 import { startLocation, onLocation, position, directionsTo, directionsRoute, remind, openExternal, isAndroidApp, speak, stopSpeaking, backgroundCheckin } from './platform.js';
 
@@ -808,14 +809,27 @@ async function loadStop(stop, useAI, progress, country) {
     progress(`${stop.name}: беру готовую подборку мест`);
     return { name: stop.name, lat: c.lat, lon: c.lon, days: stop.days, places: c.places };
   }
-  progress(`${stop.name}: ищу город на карте`);
-  const query = [stop.localName || stop.name, country].filter(Boolean).join(', ');
-  const city = await Places.geocode(query).catch(() => Places.geocode(stop.name));
-  const name = stop.why ? stop.name : city.name;
+  let city;
+  if (stop.lat != null) {
+    // Город выбран из подсказок — координаты уже точные, искать не нужно.
+    city = { name: stop.name, lat: stop.lat, lon: stop.lon };
+  } else {
+    progress(`${stop.name}: ищу город на карте`);
+    const query = [stop.localName || stop.name, country].filter(Boolean).join(', ');
+    city = await Places.geocode(query).catch(() => Places.geocode(stop.name));
+  }
+  const name = stop.why || stop.lat != null ? stop.name : city.name;
   let places;
   if (useAI) {
     progress(`${name}: ИИ подбирает места и культовую еду…`, 'обычно 20–60 секунд');
-    places = await AI.discoverPlaces(store.ai(), name, city.lat, city.lon, (t) => progress(t, 'не чаще раза в секунду — таковы правила бесплатной карты'), stop.days);
+    try {
+      places = await AI.discoverPlaces(store.ai(), name, city.lat, city.lon, (t) => progress(t, 'не чаще раза в секунду — таковы правила бесплатной карты'), stop.days);
+    } catch (err) {
+      // ИИ недоступен — не срываем поездку, берём места из OpenStreetMap.
+      toast(`${err.message} Беру места из OpenStreetMap.`);
+      progress(`${name}: загружаю места из OpenStreetMap`, 'обычно 5–30 секунд');
+      places = await Places.fetchAround(city.lat, city.lon, 6000);
+    }
   } else {
     progress(`${name}: загружаю места из OpenStreetMap`, 'обычно 5–30 секунд');
     places = await Places.fetchAround(city.lat, city.lon, 6000);
@@ -855,7 +869,8 @@ function progressCard(sheet) {
 function openNewTrip() {
   let mode = 'single'; // single | multi | country
   let stops = [{ name: 'Будапешт', days: 5 }];
-  let country = '', countryDays = 10, countryName = '', transportTips = [];
+  let country = '', countryCC = '', countryDays = 10, countryName = '', transportTips = [];
+  const acResults = {}; // поле -> текущие подсказки
   let startDate = today();
   const ai = store.ai();
   let useAI = Boolean(ai);
@@ -864,7 +879,10 @@ function openNewTrip() {
   const sheet = openModal('', { full: true });
   const stopRow = (s, i) => `
     <div class="stop">
-      <input class="input" data-name="${i}" value="${esc(s.name)}" placeholder="Например, Прага" autocomplete="off">
+      <div class="ac-field">
+        <input class="input${s.lat != null ? ' picked' : ''}" data-name="${i}" value="${esc(s.name)}" placeholder="Начни писать: Прага, Рим…" autocomplete="off" autocorrect="off" spellcheck="false">
+        ${s.lat != null ? '<span class="ok" title="Город найден">✓</span>' : ''}
+      </div>
       <div class="stepper">
         <button data-dec="${i}" aria-label="Меньше">−</button>
         <span>${s.days} дн.</span>
@@ -872,6 +890,8 @@ function openNewTrip() {
       </div>
       ${mode === 'multi' && stops.length > 1 ? `<button class="btn icon" data-del="${i}" aria-label="Убрать">✕</button>` : ''}
     </div>
+    <div class="ac" data-ac="stop-${i}"></div>
+    ${s.lat != null && s.sub ? `<p class="muted small why">📍 ${esc(s.sub)}</p>` : ''}
     ${s.why ? `<p class="muted small why">${esc(s.why)}</p>` : ''}`;
 
   const aiSwitch = () => `
@@ -896,7 +916,11 @@ function openNewTrip() {
         </div>
         ${mode === 'country' ? `
           <label class="label">Страна</label>
-          <input class="input" data-country value="${esc(country)}" placeholder="Например, Грузия" autocomplete="off">
+          <div class="ac-field">
+            <input class="input${countryCC ? ' picked' : ''}" data-country value="${esc(country)}" placeholder="Начни писать: Грузия, Италия…" autocomplete="off" autocorrect="off" spellcheck="false">
+            ${countryCC ? '<span class="ok" title="Страна найдена">✓</span>' : ''}
+          </div>
+          <div class="ac" data-ac="country"></div>
           <label class="label">Сколько дней всего</label>
           <div class="stepper wide">
             <button data-cdec aria-label="Меньше">−</button>
@@ -933,19 +957,26 @@ function openNewTrip() {
     const pc = progressCard(sheet);
     try {
       let cities;
+      let aiFailed = '';
       if (useAI && ai) {
         pc.next('ИИ продумывает маршрут по стране…', 'обычно 15–40 секунд');
-        const r = await AI.suggestRoute(ai, country.trim(), countryDays);
-        cities = r.cities;
-        transportTips = r.tips;
-      } else {
+        try {
+          const r = await AI.suggestRoute(ai, country.trim(), countryDays);
+          cities = r.cities;
+          transportTips = r.tips;
+        } catch (err) {
+          aiFailed = err.message;
+        }
+      }
+      if (aiFailed) toast(`${aiFailed} Предлагаю маршрут без ИИ.`);
+      if (!cities) {
         pc.next('Ищу главные города страны…', 'обычно 5–30 секунд');
         cities = await Places.suggestRouteOSM(country.trim(), countryDays);
         transportTips = [];
       }
       pc.stop();
       countryName = country.trim();
-      stops = cities.map((c) => ({ name: c.name, localName: c.localName, days: c.days, why: c.why }));
+      stops = cities.map((c) => ({ name: c.name, localName: c.localName, days: c.days, why: c.why, cc: countryCC || undefined }));
       mode = 'multi';
       busy = false;
       render();
@@ -999,8 +1030,18 @@ function openNewTrip() {
 
   sheet.addEventListener('input', (e) => {
     const d = e.target.dataset;
-    if (d.name != null) stops[Number(d.name)].name = e.target.value;
-    if (d.country != null) country = e.target.value;
+    if (d.name != null) {
+      const st = stops[Number(d.name)];
+      st.name = e.target.value;
+      // Текст поменяли после выбора — координаты больше не про этот город.
+      if (st.lat != null) { delete st.lat; delete st.lon; delete st.sub; e.target.classList.remove('picked'); e.target.nextElementSibling?.remove(); }
+      showSuggestions(`stop-${d.name}`, st.name, st.cc || countryCC);
+    }
+    if (d.country != null) {
+      country = e.target.value;
+      if (countryCC) { countryCC = ''; e.target.classList.remove('picked'); e.target.nextElementSibling?.remove(); }
+      showSuggestions('country', country);
+    }
     if (d.date != null) startDate = e.target.value || today();
     if (d.ai != null) { useAI = e.target.checked; render(); }
   });
@@ -1022,9 +1063,61 @@ function openNewTrip() {
     if (d.cdec != null) { countryDays = Math.max(2, countryDays - 1); render(); }
     if (d.del) { stops.splice(Number(d.del), 1); render(); }
     if (d.act === 'add') { stops.push({ name: '', days: 2 }); render(); $(`[data-name="${stops.length - 1}"]`, sheet)?.focus(); }
+    if (d.pick) {
+      const [key, idx] = d.pick.split('|');
+      const item = acResults[key][Number(idx)];
+      if (key === 'country') {
+        country = item.name;
+        countryCC = item.cc;
+      } else {
+        const st = stops[Number(key.split('-')[1])];
+        Object.assign(st, { name: item.name, lat: item.lat, lon: item.lon, cc: item.cc, sub: item.sub });
+        delete st.localName;
+      }
+      render();
+    }
+    if (d.mapsearch) mapSearch(d.mapsearch);
     if (d.act === 'suggest') suggest();
     if (d.act === 'create') create();
   });
+
+  // ---------- Подсказки ----------
+
+  let acSeq = 0;
+  async function showSuggestions(key, text, cc) {
+    const seq = ++acSeq;
+    const box = $(`[data-ac="${key}"]`, sheet);
+    if (!box) return;
+    if (text.trim().length < (key === 'country' ? 1 : 2)) { box.innerHTML = ''; return; }
+    let items;
+    try {
+      items = key === 'country' ? await Suggest.searchCountries(text) : await Suggest.searchCities(text, { cc });
+    } catch {
+      items = [];
+    }
+    if (seq !== acSeq) return; // уже набрали дальше
+    acResults[key] = items;
+    const exact = items.length === 1 && items[0].name.toLowerCase() === text.trim().toLowerCase();
+    box.innerHTML = exact && key === 'country' ? '' : `
+      ${items.map((it, i) => `<button class="ac-item" data-pick="${key}|${i}"><b>${esc(it.name)}</b><span>${esc(it.sub)}</span></button>`).join('')}
+      ${key !== 'country' && text.trim().length >= 3 ? `<button class="ac-item more" data-mapsearch="${key}">🔎 Нет нужного? Найти «${esc(text.trim())}» на карте</button>` : ''}
+      ${key === 'country' && !items.length ? '<div class="ac-empty">Такой страны не знаю — проверь написание</div>' : ''}`;
+  }
+
+  async function mapSearch(key) {
+    const box = $(`[data-ac="${key}"]`, sheet);
+    const st = stops[Number(key.split('-')[1])];
+    box.innerHTML = '<div class="ac-empty"><span class="spinner"></span> Ищу на карте…</div>';
+    try {
+      const items = await Suggest.searchOnMap(st.name, st.cc || countryCC);
+      acResults[key] = items;
+      box.innerHTML = items.length
+        ? items.map((it, i) => `<button class="ac-item" data-pick="${key}|${i}"><b>${esc(it.name)}</b><span>${esc(it.sub)}</span></button>`).join('')
+        : '<div class="ac-empty">На карте тоже не нашлось — проверь написание</div>';
+    } catch (err) {
+      box.innerHTML = `<div class="ac-empty">${esc(err.message)}</div>`;
+    }
+  }
 }
 
 // ---------- Настройки ----------

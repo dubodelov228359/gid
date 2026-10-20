@@ -66,12 +66,41 @@ function toGeminiSchema(s) {
   return out;
 }
 
-// «latest»-псевдоним Google сам переводит на актуальную Flash-модель; вторая — запасная.
-const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash'];
+// «latest»-псевдонимы Google сам переводит на актуальные модели; остальные — запасные,
+// если основную перегрузили (503) — у них отдельная очередь.
+const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function geminiRequest(key, prompt, schema) {
   let lastError;
   for (const model of GEMINI_MODELS) {
+    // Перегрузка у Google обычно на секунды — пробуем модель дважды с паузой, потом следующую.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await geminiCall(key, model, prompt, schema);
+      } catch (err) {
+        lastError = err;
+        if (!err.retry) throw err;
+        if (attempt === 0 && (err.status === 503 || err.status === 500)) await sleepMs(2500);
+        else break;
+      }
+    }
+  }
+  if (lastError?.status === 503 || lastError?.status === 500) {
+    throw new Error('Gemini сейчас перегружен — это на стороне Google, обычно проходит за пару минут.');
+  }
+  throw lastError;
+}
+
+function retryable(message, status) {
+  const e = new Error(message);
+  e.retry = true;
+  e.status = status;
+  return e;
+}
+
+async function geminiCall(key, model, prompt, schema) {
+  {
     let res;
     try {
       res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
@@ -89,14 +118,16 @@ async function geminiRequest(key, prompt, schema) {
     } catch {
       throw new Error('Нет связи с Gemini. Проверь интернет.');
     }
-    if (res.status === 404) { lastError = new Error(`Модель ${model} недоступна.`); continue; }
+    if (res.status === 404) throw retryable(`Модель ${model} недоступна.`, 404);
+    if (res.status === 503 || res.status === 500) throw retryable('Gemini перегружен.', res.status);
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       const msg = body.error?.message || '';
       const reason = body.error?.details?.find((d) => d.reason)?.reason;
       if (reason === 'API_KEY_INVALID') throw new Error('Неверный ключ Gemini. Проверь его в настройках.');
       if (/location is not supported/i.test(msg)) throw new Error('Gemini недоступен в твоей стране. Попробуй через VPN или выбери другой ИИ в настройках.');
-      if (res.status === 429) throw new Error('Лимит бесплатных запросов Gemini на сейчас исчерпан. Подожди минуту-другую и попробуй снова.');
+      // У каждой модели свой бесплатный лимит — исчерпан у этой, пробуем следующую.
+      if (res.status === 429) throw retryable('Лимит бесплатных запросов Gemini на сейчас исчерпан. Подожди минуту-другую и попробуй снова.', 429);
       throw new Error(`Ошибка Gemini (${res.status}): ${msg.slice(0, 200)}`);
     }
     const data = await res.json();
@@ -110,7 +141,6 @@ async function geminiRequest(key, prompt, schema) {
       throw new Error('Gemini ответил в неправильном формате. Попробуй ещё раз.');
     }
   }
-  throw lastError;
 }
 
 function request(ai, prompt, schema) {
