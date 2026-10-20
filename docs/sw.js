@@ -1,6 +1,6 @@
 // Офлайн для веб-версии (iPhone): само приложение кэшируется при первом открытии.
 // Тайлы карты кэширует map.js, здесь — только файлы приложения.
-const VERSION = 'tg-app-2026.10.20-1403';
+const VERSION = 'tg-app-2026.10.20-1407';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'vendor/maplibre-gl.js', 'vendor/maplibre-gl.css',
@@ -10,7 +10,10 @@ const FILES = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' — мимо HTTP-кэша браузера, иначе можно сохранить старую версию файла.
+  e.waitUntil(caches.open(VERSION)
+    .then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {
@@ -24,7 +27,8 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
   e.respondWith(
-    fetch(e.request)
+    // no-cache: браузер всегда сверяется с сайтом, так обновления видны сразу после выкладки.
+    fetch(e.request, { cache: 'no-cache' })
       .then((res) => {
         const copy = res.clone();
         caches.open(VERSION).then((c) => c.put(e.request, copy));

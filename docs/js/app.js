@@ -1332,5 +1332,13 @@ syncBackgroundCheckin();
 pullBackgroundVisits();
 
 if ('serviceWorker' in navigator && !isAndroidApp && window.location.protocol === 'https:') {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // updateViaCache: 'none' — сам sw.js тоже всегда сверяем с сайтом.
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
+  // Пришла новая версия — один раз перезагружаемся, чтобы сразу показать её.
+  if (navigator.serviceWorker.controller) {
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!reloaded) { reloaded = true; window.location.reload(); }
+    });
+  }
 }
