@@ -1,6 +1,7 @@
 // ИИ-часть: подборка мест для любого города и умный план по дням.
 // Два провайдера: Google Gemini (есть бесплатный тариф) и Claude. Ключи хранятся только на телефоне.
 import { CATEGORIES, addDays, distance, humanDay } from './geo.js';
+import { fetchCandidates } from './places.js';
 
 export const PROVIDERS = {
   gemini: { title: 'Gemini', note: 'бесплатно', keyUrl: 'https://aistudio.google.com/apikey' },
@@ -156,7 +157,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * (Nominatim, не чаще 1 запроса в секунду — таковы правила сервиса): нашли рядом — берём точные
  * координаты, не нашли — помечаем «не проверено».
  */
-async function verifyPlaces(places, city, center, progress) {
+async function verifyPlaces(places, city, center, progress, { anyDistance = false } = {}) {
   for (let i = 0; i < places.length; i++) {
     const p = places[i];
     progress?.(`Сверяю места с картой: ${i + 1} из ${places.length}`);
@@ -176,7 +177,8 @@ async function verifyPlaces(places, city, center, progress) {
       await sleep(1100);
       if (found) break;
     }
-    if (found && distance(found.lat, found.lon, p.lat, p.lon) < 3000) {
+    // Для мест без координат от ИИ (anyDistance) достаточно, что нашлось в пределах города.
+    if (found && (anyDistance || distance(found.lat, found.lon, p.lat, p.lon) < 3000)) {
       p.lat = found.lat;
       p.lon = found.lon;
     } else {
@@ -188,9 +190,101 @@ async function verifyPlaces(places, city, center, progress) {
 
 // ---------- Подборка мест ----------
 
+const PLACE_FIELDS = {
+  summary: { type: 'string' },
+  mustSee: { type: 'boolean' },
+  durationMin: { type: 'integer' },
+  closedWeekdays: { type: 'array', items: { type: 'integer' } },
+  ticketAdvanceDays: { type: 'integer' },
+  ticketNote: { type: 'string' },
+};
+
+const PLACE_RULES = `- summary: 1–2 предложения по-русски, почему стоит сходить и полезный совет;
+- mustSee: true только для действительно обязательных мест (не больше трети);
+- durationMin: сколько времени закладывать;
+- closedWeekdays: дни, когда место обычно закрыто (1 = воскресенье … 7 = суббота), или [];
+- ticketAdvanceDays: за сколько дней нужно купить билет или забронировать столик, 0 если не нужно;
+- ticketNote: где и как покупать билеты или бронировать, или пустая строка.`;
+
+const placeExtras = (p) => ({
+  summary: p.summary || '',
+  mustSee: Boolean(p.mustSee),
+  durationMin: Math.max(15, p.durationMin || 60),
+  closedWeekdays: (p.closedWeekdays || []).filter((d) => d >= 1 && d <= 7),
+  ticketAdvanceDays: p.ticketAdvanceDays > 0 ? p.ticketAdvanceDays : undefined,
+  ticketNote: p.ticketNote || undefined,
+});
+
+/**
+ * Подборка мест. Главный путь: берём с карты все реальные места города, а ИИ выбирает из них
+ * лучшие и описывает — координаты всегда настоящие. Если карта недоступна — ИИ называет места
+ * сам, а мы оставляем только те, что нашлись на карте.
+ */
 export async function discoverPlaces(ai, city, lat, lon, progress, days = 5) {
-  // Мест — по количеству дней: так и ИИ, и сверка с картой работают быстрее.
   const count = Math.max(10, Math.min(35, days * 8));
+  let candidates = [];
+  try {
+    progress?.('Загружаю с карты реальные места города…');
+    candidates = await fetchCandidates(lat, lon, 4000);
+    if (candidates.length < 40) candidates = await fetchCandidates(lat, lon, 10000);
+  } catch {
+    candidates = [];
+  }
+  if (candidates.length >= 10) return pickFromCandidates(ai, city, candidates, count, days, { lat, lon }, progress);
+  return discoverFreeform(ai, city, lat, lon, progress, count, days);
+}
+
+async function pickFromCandidates(ai, city, candidates, count, days, center, progress) {
+  progress?.(`ИИ выбирает лучшее из ${candidates.length} мест на карте…`);
+  // Короткие номера вместо длинных id — меньше текста и меньше шансов, что ИИ их перепутает.
+  const lines = candidates.map((c, i) => `c${i} | ${c.name}${c.local !== c.name ? ` (${c.local})` : ''} | ${c.kind}${c.hours ? ` | часы: ${c.hours}` : ''}`);
+  const prompt = `Ты — опытный местный гид. Турист проведёт ${days} дн. в городе ${city}.
+Ниже — реальные места этого города с карты (номер | название | тип | часы работы). Выбери из них примерно ${count} лучших для туриста: главные достопримечательности, музеи, виды, пляжи и парки, и обязательно культовые гастрономические места (легендарные кафе, рынки, рестораны местной кухни, известные десерты, бары). Если город небольшой, выбери меньше. Не выбирай случайные сетевые заведения и малоизвестные точки.
+
+${lines.join('\n')}
+
+Для каждого выбранного места:
+- id: номер из списка (например, c12) — только из списка;
+- name: название по-русски, как его называют русскоязычные туристы;
+- category: тип;
+${PLACE_RULES}
+closedWeekdays выводи из часов работы, если они указаны.
+
+missing: если какого-то действительно знаменитого места города нет в списке (до 5 штук) — укажи его: name по-русски, localName на местном языке и остальные поля. Только если уверен, что оно существует.`;
+  const chosenItem = object({ id: { type: 'string' }, name: { type: 'string' }, category: { type: 'string', enum: Object.keys(CATEGORIES) }, ...PLACE_FIELDS });
+  const missingItem = object({ name: { type: 'string' }, localName: { type: 'string' }, category: { type: 'string', enum: Object.keys(CATEGORIES) }, ...PLACE_FIELDS });
+  const result = await request(ai, prompt, object({
+    places: { type: 'array', items: chosenItem },
+    missing: { type: 'array', items: missingItem },
+  }));
+
+  const used = new Set();
+  const places = [];
+  for (const p of result.places || []) {
+    const c = candidates[Number(String(p.id).replace(/\D/g, ''))];
+    if (!c || used.has(c.id)) continue;
+    used.add(c.id);
+    places.push({
+      id: c.id,
+      name: p.name || c.name,
+      localName: c.local,
+      category: CATEGORIES[p.category] ? p.category : c.category,
+      lat: c.lat, lon: c.lon,
+      url: c.url,
+      ...placeExtras(p),
+    });
+  }
+  // Знаменитые места, которых не было в списке, — только если нашлись на карте.
+  const missing = (result.missing || []).slice(0, 5).map((p, i) => ({
+    id: `ai-${Date.now().toString(36)}-m${i}`, name: p.name, localName: p.localName || undefined,
+    category: CATEGORIES[p.category] ? p.category : 'sight', lat: center.lat, lon: center.lon, ...placeExtras(p),
+  }));
+  if (missing.length) places.push(...(await verifyPlaces(missing, city, center, progress, { anyDistance: true })).filter((p) => !p.unverified));
+  if (!places.length) throw new Error('ИИ не смог подобрать места для этого города.');
+  return places;
+}
+
+async function discoverFreeform(ai, city, lat, lon, progress, count, days) {
   const prompt = `Ты — опытный местный гид. Составь подборку примерно из ${count} мест для туриста, который проведёт ${days} дн. в городе ${city} (центр примерно ${lat}, ${lon}). Если город небольшой, достаточно меньшего числа мест.
 Нужны: главные достопримечательности, музеи, смотровые площадки, парки, и обязательно — культовые гастрономические места (легендарные кафе, рынки, заведения с местной кухней, знаменитые десерты, бары), ради которых сюда едут.
 Включай только реально существующие и работающие места, в которых ты уверен. Лучше меньше мест, чем выдуманные.
@@ -198,24 +292,10 @@ export async function discoverPlaces(ai, city, lat, lon, progress, days = 5) {
 - name: название по-русски, как его обычно называют русскоязычные туристы;
 - localName: официальное название на местном языке (для поиска на карте);
 - точные координаты (lat, lon);
-- summary: 1–2 предложения по-русски, почему стоит сходить и полезный совет;
-- mustSee: true только для действительно обязательных мест (не больше трети);
-- durationMin: сколько времени закладывать;
-- closedWeekdays: дни, когда место обычно закрыто (1 = воскресенье … 7 = суббота), или [];
-- ticketAdvanceDays: за сколько дней нужно купить билет или забронировать столик, 0 если не нужно;
-- ticketNote: где и как покупать билеты или бронировать, или пустая строка.`;
+${PLACE_RULES}`;
   const item = object({
-    name: { type: 'string' },
-    localName: { type: 'string' },
-    category: { type: 'string', enum: Object.keys(CATEGORIES) },
-    lat: { type: 'number' },
-    lon: { type: 'number' },
-    summary: { type: 'string' },
-    mustSee: { type: 'boolean' },
-    durationMin: { type: 'integer' },
-    closedWeekdays: { type: 'array', items: { type: 'integer' } },
-    ticketAdvanceDays: { type: 'integer' },
-    ticketNote: { type: 'string' },
+    name: { type: 'string' }, localName: { type: 'string' }, category: { type: 'string', enum: Object.keys(CATEGORIES) },
+    lat: { type: 'number' }, lon: { type: 'number' }, ...PLACE_FIELDS,
   });
   const result = await request(ai, prompt, object({ places: { type: 'array', items: item } }));
   const slug = city.toLowerCase().replace(/[^\p{L}]/gu, '');
@@ -224,22 +304,14 @@ export async function discoverPlaces(ai, city, lat, lon, progress, days = 5) {
     .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon) && CATEGORIES[p.category])
     .slice(0, 45)
     .map((p, i) => ({
-      id: `ai-${slug}-${stamp}-${i}`,
-      name: p.name,
-      localName: p.localName || undefined,
-      category: p.category,
-      lat: p.lat, lon: p.lon,
-      summary: p.summary,
-      mustSee: Boolean(p.mustSee),
-      durationMin: Math.max(15, p.durationMin || 60),
-      closedWeekdays: (p.closedWeekdays || []).filter((d) => d >= 1 && d <= 7),
-      ticketAdvanceDays: p.ticketAdvanceDays > 0 ? p.ticketAdvanceDays : undefined,
-      ticketNote: p.ticketNote || undefined,
+      id: `ai-${slug}-${stamp}-${i}`, name: p.name, localName: p.localName || undefined, category: p.category,
+      lat: p.lat, lon: p.lon, ...placeExtras(p),
     }))
-    // Место дальше 30 км от центра — точно ошибка.
     .filter((p) => distance(p.lat, p.lon, lat, lon) < 30000);
-  if (!places.length) throw new Error('ИИ не смог подобрать места для этого города.');
-  return verifyPlaces(places, city, { lat, lon }, progress);
+  // ИИ путается в координатах — оставляем только то, что нашлось на карте.
+  const verified = (await verifyPlaces(places, city, { lat, lon }, progress)).filter((p) => !p.unverified);
+  if (!verified.length) throw new Error('Не удалось найти на карте места, которые предложил ИИ.');
+  return verified;
 }
 
 // ---------- План по дням ----------

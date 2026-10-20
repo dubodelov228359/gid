@@ -275,7 +275,7 @@ let banner = null;
 /** Все непосещённые места из всех поездок — то, что можно отметить. */
 function checkinCandidates() {
   const seen = new Map();
-  for (const t of store.trips) for (const p of allPlaces(t)) if (!store.isVisited(p.id)) seen.set(p.id, p);
+  for (const t of store.trips) for (const p of allPlaces(t)) if (!store.isVisited(p.id) && !p.unverified) seen.set(p.id, p);
   return [...seen.values()];
 }
 
@@ -469,7 +469,8 @@ function MapTab(trip) {
   const filter = new Set();
   let hideVisited = false;
 
-  const visible = () => allPlaces(trip()).filter((p) =>
+  // Места без подтверждённых координат на карту не ставим — они могли бы оказаться «в море».
+  const visible = () => allPlaces(trip()).filter((p) => !p.unverified &&
     (!filter.size || filter.has(p.category)) && !(hideVisited && store.isVisited(p.id)));
 
   const renderPins = () => {
@@ -521,7 +522,7 @@ function MapTab(trip) {
 }
 
 function NearTab(trip) {
-  return NearList(() => allPlaces(trip()), (id) => placeById(trip(), id));
+  return NearList(() => allPlaces(trip()).filter((p) => !p.unverified), (id) => placeById(trip(), id));
 }
 
 /** Список мест по расстоянию от текущей точки. Используется и в поездке, и в «Что рядом». */
@@ -624,7 +625,7 @@ function PlanTab(trip) {
         const dayBtn = e.target.closest('[data-day]');
         if (dayBtn) {
           const day = trip().plan[Number(dayBtn.dataset.day)];
-          openDayMap(day.placeIds.map((pid) => placeById(trip(), pid)).filter(Boolean), Number(dayBtn.dataset.day) + 1);
+          openDayMap(day.placeIds.map((pid) => placeById(trip(), pid)).filter((p) => p && !p.unverified), Number(dayBtn.dataset.day) + 1);
           return;
         }
         const gBtn = e.target.closest('[data-guides]');
@@ -742,6 +743,7 @@ function openTripMenu(trip) {
     <div class="menu">
       <button data-act="offline">⬇️ Скачать карту для офлайна${offline ? `<small>Скачано ${new Date(offline.date).toLocaleDateString('ru-RU')} — обновить</small>` : '<small>Карта города будет работать без интернета (~10–40 МБ)</small>'}</button>
       <button data-act="replan">↻ Пересобрать план<small>Без мест, где ты уже был</small></button>
+      <button data-act="recheck">🎯 Уточнить места по карте<small>Поправить точки, которые стоят не там (например, в море)</small></button>
       <button data-act="delete" class="danger">🗑 Удалить поездку</button>
     </div>
     <div class="progress-slot"></div>`);
@@ -752,6 +754,17 @@ function openTripMenu(trip) {
         closeModal();
         store.deleteTrip(trip.id);
         window.location.hash = '#/';
+      }
+    }
+    if (act === 'recheck') {
+      const slot = $('.progress-slot', sheet);
+      try {
+        const r = await recheckPlaces(store.trip(trip.id), (t) => { slot.innerHTML = `<p class="center"><span class="spinner"></span> ${esc(t)}</p>`; });
+        store.saveTrip(r.trip);
+        slot.innerHTML = `<p class="success-text">✓ Уточнено по карте: ${r.fixed}.</p>${r.missing
+          ? `<p class="small">Не нашлись на карте: ${r.missing} — убрал их с карты и из «Рядом» (в плане остались с пометкой ⚠︎).</p>` : ''}`;
+      } catch (err) {
+        slot.innerHTML = `<p class="error">${esc(err.message)}</p>`;
       }
     }
     if (act === 'replan') {
@@ -781,6 +794,35 @@ function openTripMenu(trip) {
       }
     }
   });
+}
+
+/**
+ * Перепроверка уже созданной поездки: каждое место, предложенное ИИ, ищем среди реальных мест
+ * с карты по названию и ставим на настоящие координаты. id не меняем — отметки и гиды сохраняются.
+ */
+async function recheckPlaces(trip, progress) {
+  let fixed = 0, missing = 0;
+  const stops = [];
+  for (const st of trip.stops) {
+    if (!st.places.some((p) => p.id.startsWith('ai-'))) { stops.push(st); continue; }
+    progress(`${st.name}: загружаю места с карты…`);
+    const candidates = await Places.fetchCandidates(st.lat, st.lon, 10000);
+    stops.push({
+      ...st,
+      places: st.places.map((p) => {
+        if (!p.id.startsWith('ai-')) return p; // из карты или встроенной подборки — и так точные
+        const c = Places.matchCandidate(p, candidates);
+        if (c) {
+          fixed++;
+          const { unverified, ...rest } = p;
+          return { ...rest, lat: c.lat, lon: c.lon, localName: p.localName || c.local, url: p.url || c.url };
+        }
+        missing++;
+        return { ...p, unverified: true };
+      }),
+    });
+  }
+  return { trip: { ...trip, stops }, fixed, missing };
 }
 
 // ---------- Создание поездки ----------

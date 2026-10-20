@@ -212,3 +212,119 @@ export async function wikiGuide(place, city) {
     savedAt: new Date().toISOString(),
   };
 }
+
+// ---------- Реальные места города — кандидаты для ИИ ----------
+
+/**
+ * Все именованные места вокруг точки из OpenStreetMap: координаты у них настоящие.
+ * ИИ потом только выбирает из них лучшие и описывает — так места не окажутся в море.
+ */
+export async function fetchCandidates(lat, lon, radius) {
+  const a = `(around:${radius},${lat},${lon})`;
+  const data = await runOverpass(`[out:json][timeout:25];
+(
+  nwr["tourism"~"^(attraction|museum|viewpoint|gallery|zoo|aquarium|theme_park)$"]["name"]${a};
+  nwr["historic"]["name"]${a};
+  nwr["amenity"~"^(place_of_worship|marketplace|public_bath|theatre)$"]["name"]${a};
+  nwr["leisure"~"^(park|garden|nature_reserve|beach_resort|marina)$"]["name"]${a};
+  nwr["natural"~"^(beach|peak|cave_entrance)$"]["name"]${a};
+  nwr["amenity"~"^(restaurant|cafe|bar|pub|ice_cream|biergarten)$"]["name"]${a};
+  nwr["shop"~"^(bakery|pastry|confectionery)$"]["name"]${a};
+);
+out center tags 2000;`);
+  return parseCandidates(data, lat, lon);
+}
+
+function candidateCategory(t) {
+  if (t.natural === 'beach' || t.leisure === 'beach_resort' || t.leisure === 'nature_reserve' || t.leisure === 'marina') return 'park';
+  if (t.natural === 'peak' || t.natural === 'cave_entrance') return 'viewpoint';
+  if (t.amenity === 'marketplace') return 'food';
+  if (t.tourism === 'museum') return 'museum';
+  if (t.amenity === 'place_of_worship') return 'church';
+  if (t.amenity === 'theatre' || t.historic) return 'sight';
+  if (t.amenity === 'ice_cream' || t.shop) return 'cafe';
+  if (t.amenity === 'biergarten') return 'bar';
+  return categoryFor(t);
+}
+
+export function parseCandidates(data, lat, lon) {
+  const seen = new Set();
+  const list = [];
+  for (const e of data.elements || []) {
+    const t = e.tags || {};
+    const clat = e.lat ?? e.center?.lat;
+    const clon = e.lon ?? e.center?.lon;
+    if (!t.name || clat == null || clon == null) continue;
+    const key = t.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const category = candidateCategory(t);
+    const food = ['food', 'cafe', 'bar'].includes(category);
+    // Чем больше признаков известности, тем выше в списке для ИИ.
+    const score = (t.wikidata ? 4 : 0) + (t.wikipedia ? 3 : 0) + (t.tourism ? 2 : 0) + (t.website ? 1 : 0)
+      + (t.opening_hours ? 1 : 0) + (t['name:en'] || t['name:ru'] ? 1 : 0);
+    list.push({
+      id: `osm-${e.type}-${e.id}`,
+      name: t['name:ru'] || t['name:en'] || t.name,
+      local: t.name,
+      names: [t.name, t['name:ru'], t['name:en'], t['name:he'], t['name:ka'], t.alt_name, t.int_name].filter(Boolean),
+      kind: Object.entries({ tourism: t.tourism, historic: t.historic, amenity: t.amenity, leisure: t.leisure, natural: t.natural, shop: t.shop, cuisine: t.cuisine })
+        .filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(', '),
+      hours: t.opening_hours,
+      category, food, score,
+      lat: clat, lon: clon,
+      dist: distance(lat, lon, clat, clon),
+      url: t.website || (t.wikipedia ? wikipediaURL(t.wikipedia) : undefined),
+    });
+  }
+  // Не больше ~250 достопримечательностей и ~200 заведений: важные и поближе к центру.
+  const rank = (a, b) => b.score - a.score || a.dist - b.dist;
+  return [
+    ...list.filter((c) => !c.food).sort(rank).slice(0, 250),
+    ...list.filter((c) => c.food).sort(rank).slice(0, 200),
+  ];
+}
+
+// ---------- Сопоставление названий ----------
+
+const STOPWORDS = new Set(['the', 'of', 'and', 'de', 'la', 'le', 'и', 'в', 'на', 'restaurant', 'ресторан', 'cafe', 'кафе', 'café', 'bar', 'бар']);
+
+const TRANSLIT = { а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ж: 'zh', з: 'z', и: 'i', й: 'i', к: 'k', л: 'l', м: 'm', н: 'n',
+  о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'h', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya' };
+
+/** «Звучание» слова латиницей: «Пинати» и Pinati, «Галиль» и Galil дают одно и то же. */
+function sound(w) {
+  const lat = /[а-я]/.test(w) ? [...w].map((ch) => TRANSLIT[ch] ?? ch).join('') : w;
+  if (!/^[a-z\d]+$/.test(lat)) return null; // иврит, грузинский и т.п. — сравниваем как есть
+  return lat.replace(/kh/g, 'h').replace(/ph/g, 'f').replace(/c/g, 'k').replace(/w/g, 'v').replace(/[yj]/g, 'i').replace(/(.)\1+/g, '$1');
+}
+
+function words(s) {
+  return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ё/g, 'е')
+    .replace(/[^\p{L}\d]+/gu, ' ').split(' ').filter((w) => w.length > 1 && !STOPWORDS.has(w));
+}
+
+/** Насколько похожи два названия: 1 — совпадают, 0 — ничего общего. Разные алфавиты сравниваем по звучанию. */
+export function nameSimilarity(a, b) {
+  const wa = words(a), wb = words(b);
+  if (!wa.length || !wb.length) return 0;
+  const key = (w) => sound(w) ?? w;
+  const sb = new Set(wb.map(key));
+  const common = new Set(wa.map(key).filter((k) => sb.has(k))).size;
+  return common / Math.min(new Set(wa.map(key)).size, sb.size);
+}
+
+/** Ищет место среди кандидатов с карты по любому из названий; ближе к примерной точке — лучше. */
+export function matchCandidate(place, candidates, maxDist = 15000) {
+  const names = [place.name, place.localName].filter(Boolean);
+  let best = null;
+  for (const c of candidates) {
+    const sim = Math.max(...names.flatMap((n) => c.names.map((cn) => nameSimilarity(n, cn))));
+    if (sim < 0.6) continue;
+    const d = distance(place.lat, place.lon, c.lat, c.lon);
+    if (d > maxDist) continue;
+    const score = sim * 10 - d / 2000;
+    if (!best || score > best.score) best = { c, score };
+  }
+  return best?.c || null;
+}
