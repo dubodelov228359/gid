@@ -1,0 +1,8 @@
+# Сборка Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+# Ключ подписи — никогда не публикуем (хранится отдельно у владельца)
+android/keystore/
+*.jks
