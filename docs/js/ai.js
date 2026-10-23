@@ -575,3 +575,34 @@ export async function countryOverview(ai, country, home, signal) {
   }), { quick: true, signal });
   return { ...r, country, home, savedAt: new Date().toISOString() };
 }
+
+// ---------- Горячие направления ----------
+
+export async function hotDeals(ai, { home, month, budgetMax, exclude = [] }, signal) {
+  const prompt = `Турист живёт в городе ${home}. Подбери 7 направлений для поездки в ${month}, куда в это время выгодно и приятно поехать: хороший сезон (погода, нет сезона дождей и экстремальной жары), разумные цены на перелёт из ${home}${budgetMax ? `, и чтобы вся поездка с перелётом укладывалась примерно в $${budgetMax} на человека` : ''}.
+Разнообразь: ближние и подальше, города и страны, море, горы, гастрономия, история.${exclude.length ? ` Не повторяй: ${exclude.join(', ')}.` : ''}
+Для каждого направления:
+- kind: "city" если ехать в конкретный город, "country" если по стране;
+- title: название по-русски (город или страна);
+- country: страна по-русски; cc: двухбуквенный код страны ISO;
+- iata: код главного аэропорта прилёта;
+- why: 1–2 предложения, почему именно в ${month} (сезон, события, цены);
+- flightMin, flightMax: типичная цена перелёта туда-обратно из ${home} в долларах США в этом месяце;
+- direct: есть ли прямые рейсы;
+- perDay: расходы в день на человека без перелёта, средний уровень (отель 3*, кафе), в долларах;
+- days: сколько дней заложить;
+- tags: 2–3 коротких тега (например «море», «горы», «еда»).
+Будь честен с ценами: лучше шире диапазон, чем выдуманная точность.`;
+  const deal = object({
+    kind: { type: 'string', enum: ['city', 'country'] }, title: { type: 'string' }, country: { type: 'string' }, cc: { type: 'string' },
+    iata: { type: 'string' }, why: { type: 'string' }, flightMin: { type: 'integer' }, flightMax: { type: 'integer' },
+    direct: { type: 'boolean' }, perDay: { type: 'integer' }, days: { type: 'integer' }, tags: { type: 'array', items: { type: 'string' } },
+  });
+  const r = await request(ai, prompt, object({ deals: { type: 'array', items: deal } }), { quick: true, signal });
+  return (r.deals || []).filter((d) => d.title && d.flightMax > 0 && d.days > 0).map((d) => ({
+    ...d,
+    cc: (d.cc || '').toUpperCase().slice(0, 2),
+    iata: (d.iata || '').toUpperCase().slice(0, 3),
+    days: Math.max(2, Math.min(21, d.days)),
+  }));
+}

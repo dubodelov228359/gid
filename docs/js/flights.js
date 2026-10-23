@@ -66,3 +66,8 @@ export function searchLinks(from, to, depart, back) {
     { title: 'Skyscanner', url: `https://www.skyscanner.net/transport/flights/${f.toLowerCase()}/${t.toLowerCase()}/${ymd(depart)}/${back ? `${ymd(back)}/` : ''}` },
   ];
 }
+
+/** Аэропорт по коду из встроенного списка (чтобы проверить код, который назвал ИИ). */
+export async function airportByCode(iata) {
+  return (await loadAirports()).find((a) => a.iata === iata) || null;
+}

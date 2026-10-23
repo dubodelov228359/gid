@@ -393,6 +393,10 @@ function HomeScreen() {
     root.innerHTML = `
       <header class="bar"><h1>Гид</h1><button class="btn icon" data-act="settings" aria-label="Настройки">⚙︎</button></header>
       <main class="scroll pad">
+        <a class="card hero" href="#/deals">
+          <div class="hero-icon">🔥</div>
+          <div><b>Куда полететь</b><div class="muted small">Где сейчас сезон и недорогие билеты — с бюджетом на всю поездку</div></div>
+        </a>
         <a class="card hero" href="#/explore">
           <div class="hero-icon">📍</div>
           <div><b>Что рядом со мной</b><div class="muted small">Интересные места вокруг, без всяких планов</div></div>
@@ -1057,13 +1061,15 @@ function overviewHTML(o, { daysButton = false } = {}) {
   </div>`;
 }
 
-function openNewTrip() {
-  let mode = 'single'; // single | multi | country
-  let stops = [{ name: 'Будапешт', days: 5 }];
-  let country = '', countryCC = '', countryDays = 10, countryName = '', transportTips = [];
+/** prefill — из «Куда полететь»: { mode, city, country, cc, days, startDate }. */
+function openNewTrip(prefill = {}) {
+  let mode = prefill.mode || 'single'; // single | multi | country
+  let stops = [{ name: prefill.city || (prefill.mode ? '' : 'Будапешт'), days: prefill.days || 5, cc: prefill.cc || undefined }];
+  let country = prefill.country || '', countryCC = prefill.mode === 'country' ? (prefill.cc || '') : '';
+  let countryDays = prefill.mode === 'country' ? prefill.days : 10, countryName = '', transportTips = [];
   let overview = null, overviewBusy = false, overviewError = '', overviewCtl = null, overviewStarted = 0;
   const acResults = {}; // поле -> текущие подсказки
-  let startDate = today();
+  let startDate = prefill.startDate || today();
   const ai = store.ai();
   let useAI = Boolean(ai);
   let busy = false;
@@ -1551,6 +1557,138 @@ function ExploreScreen() {
   };
 }
 
+// ---------- Куда полететь ----------
+
+const MONTHS = ['январе', 'феврале', 'марте', 'апреле', 'мае', 'июне', 'июле', 'августе', 'сентябре', 'октябре', 'ноябре', 'декабре'];
+const flag = (cc) => (/^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc].map((c) => 0x1f1a5 + c.charCodeAt(0))) : '🌍');
+
+/** Даты поездки для «через N месяцев»: сейчас — через 2 недели, иначе — с середины месяца. */
+function dealDates(offset, days) {
+  const d = new Date();
+  if (offset === 0) d.setDate(d.getDate() + 14);
+  else { d.setDate(1); d.setMonth(d.getMonth() + offset); d.setDate(15); }
+  const p = (n) => String(n).padStart(2, '0');
+  const start = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return { start, end: addDays(start, days), monthName: MONTHS[d.getMonth()], year: d.getFullYear() };
+}
+
+function DealsScreen() {
+  let root, offset = 0, budget = 0, deals = null, loading = false, error = '', ctl = null, started = 0, tick = null;
+  const BUDGETS = [0, 800, 1500, 2500];
+  const cacheKey = () => `tg.deals.${store.home.name}.${dealDates(offset, 7).monthName}.${budget}`;
+
+  const readCache = () => {
+    try {
+      const c = JSON.parse(localStorage.getItem(cacheKey()) || 'null');
+      return c && Date.now() - c.at < 24 * 3600 * 1000 ? c.deals : null;
+    } catch { return null; }
+  };
+
+  const load = async (force = false) => {
+    const ai = store.ai();
+    deals = force ? null : readCache();
+    if (deals || !ai) { render(); return; }
+    loading = true; error = ''; ctl = new AbortController(); started = Date.now(); render();
+    tick = setInterval(() => { const el = root.querySelector('[data-elapsed]'); if (el) el.textContent = Math.round((Date.now() - started) / 1000); }, 1000);
+    try {
+      const { monthName, year } = dealDates(offset, 7);
+      deals = await AI.hotDeals(ai, { home: store.home.name, month: `${monthName} ${year}`, budgetMax: budget || null }, ctl.signal);
+      // ИИ не всегда держит бюджет — лишнее отсекаем сами (по нижней границе итога).
+      if (budget) deals = deals.filter((d) => d.flightMin + d.perDay * d.days <= budget * 1.1);
+      try { localStorage.setItem(cacheKey(), JSON.stringify({ at: Date.now(), deals })); } catch { /* ок */ }
+    } catch (err) {
+      error = err.cancelled ? '' : err.message;
+    }
+    clearInterval(tick);
+    loading = false; render();
+  };
+
+  const card = (d, i) => {
+    const days = d.days;
+    const stay = d.perDay * days;
+    const totalMin = d.flightMin + stay, totalMax = d.flightMax + stay;
+    return `<div class="card deal">
+      <div class="deal-head">
+        <span class="deal-flag">${flag(d.cc)}</span>
+        <div class="row-main"><b>${esc(d.title)}</b>${d.kind === 'city' && d.country !== d.title ? `<div class="muted small">${esc(d.country)}</div>` : ''}</div>
+        <div class="deal-total"><b>${usd(totalMin)}–${usd(totalMax)}</b><span>вся поездка</span></div>
+      </div>
+      <p>${esc(d.why)}</p>
+      <div class="deal-facts">
+        <span>✈️ ${usd(d.flightMin)}–${usd(d.flightMax)}${d.direct ? ' · прямой' : ''}</span>
+        <span>🏨 ~${usd(d.perDay)}/день</span>
+        <span>📅 ${days} дн.</span>
+      </div>
+      ${d.tags?.length ? `<div class="deal-tags">${d.tags.map((t) => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
+      <div class="actions">
+        <button class="btn primary" data-plan="${i}">Спланировать</button>
+        <button class="btn" data-tickets="${i}">Билеты</button>
+      </div>
+    </div>`;
+  };
+
+  const render = () => {
+    const ai = store.ai();
+    const { monthName } = dealDates(offset, 7);
+    const labels = ['Сейчас', 'Через месяц', 'Через 2 месяца'];
+    keepScroll(root, () => {
+      root.innerHTML = `
+        <header class="bar">
+          <button class="btn icon" data-act="back" aria-label="Назад">‹</button>
+          <h1>Куда полететь</h1>
+          <button class="btn icon" data-act="refresh" aria-label="Другие варианты" ${loading || !ai ? 'disabled' : ''}>↻</button>
+        </header>
+        <main class="scroll pad">
+          <div class="segmented">${labels.map((l, i) => `<button class="${offset === i ? 'on' : ''}" data-offset="${i}">${l}</button>`).join('')}</div>
+          <div class="chips" style="padding:10px 0">${BUDGETS.map((b) => `<button class="chip${budget === b ? ' on' : ''}" data-budget="${b}">${b ? `до ${usd(b)}` : 'Любой бюджет'}</button>`).join('')}</div>
+          <p class="muted small">Поездки в ${monthName} · вылет: ${esc(store.home.name)} (поменять — в ⚙︎). Итог = перелёт туда-обратно + отель и еда среднего уровня на человека.</p>
+          ${!ai ? '<div class="empty">Подборку делает ИИ — подключи его в настройках ⚙︎ (Gemini бесплатно).</div>' : ''}
+          ${loading ? `<div class="progress-card"><span class="spinner"></span><div class="row-main"><div>ИИ ищет, куда сейчас выгодно…</div><div class="muted small">обычно 10–30 секунд · прошло <span data-elapsed>0</span> с</div></div><button class="btn" data-act="cancel">Отмена</button></div>` : ''}
+          ${error ? `<p class="error">${esc(error)}</p><button class="btn block" data-act="refresh">Попробовать ещё раз</button>` : ''}
+          ${deals ? deals.map(card).join('') + '<p class="muted small center">⚠︎ Цены — оценка ИИ, а не живые цены. Точные — по кнопке «Билеты».</p>' : ''}
+        </main>`;
+    });
+  };
+
+  return {
+    mount(el) {
+      root = el;
+      load();
+      el.onclick = async (e) => {
+        const t = e.target.closest('button');
+        if (!t) return;
+        const d = t.dataset;
+        if (d.act === 'back') { window.location.hash = '#/'; return; }
+        if (d.act === 'cancel') { ctl?.abort(); return; }
+        if (d.act === 'refresh') { load(true); return; }
+        if (loading) return;
+        if (d.offset) { offset = Number(d.offset); load(); return; }
+        if (d.budget) { budget = Number(d.budget); load(); return; }
+        if (d.plan) {
+          const deal = deals[Number(d.plan)];
+          const { start } = dealDates(offset, deal.days);
+          openNewTrip(deal.kind === 'country'
+            ? { mode: 'country', country: deal.title, cc: deal.cc, days: deal.days, startDate: start }
+            : { mode: 'single', city: deal.title, cc: deal.cc, days: deal.days, startDate: start });
+          return;
+        }
+        if (d.tickets) {
+          const deal = deals[Number(d.tickets)];
+          const { start, end } = dealDates(offset, deal.days);
+          const [from, to] = await Promise.all([
+            Flights.nearestAirport(store.home.lat, store.home.lon),
+            Flights.airportByCode(deal.iata),
+          ]);
+          if (!from || !to) { toast('Не знаю такой аэропорт — поищи билеты вручную'); return; }
+          openExternal(Flights.searchLinks(from, to, start, end)[0].url);
+        }
+      };
+    },
+    update: render,
+    unmount() { clearInterval(tick); ctl?.abort(); },
+  };
+}
+
 // ---------- Навигация ----------
 
 let screen = null;
@@ -1563,6 +1701,7 @@ function route() {
   const [name, id, tab] = window.location.hash.replace(/^#\/?/, '').split('/');
   if (name === 'trip' && store.trip(id)) screen = TripScreen(id, tab);
   else if (name === 'explore') screen = ExploreScreen();
+  else if (name === 'deals') screen = DealsScreen();
   else screen = HomeScreen();
   app.innerHTML = '';
   app.onclick = null;
