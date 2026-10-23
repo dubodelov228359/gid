@@ -15,7 +15,7 @@ function object(properties) {
 // ---------- Claude ----------
 
 async function claudeRequest(key, prompt, schema, opts = {}) {
-  let res;
+  let res, raw;
   const { signal, done, timedOut } = withTimeout(opts.signal, opts.quick ? 90000 : 240000);
   try {
     res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -38,20 +38,20 @@ async function claudeRequest(key, prompt, schema, opts = {}) {
       }),
       signal,
     });
+    raw = await res.text(); // лимит времени действует, пока ответ не скачан целиком
   } catch {
-    done();
     if (opts.signal?.aborted) throw cancelled();
     if (timedOut()) throw new Error('Claude слишком долго отвечает. Попробуй ещё раз.');
     throw new Error('Нет связи с Claude. Проверь интернет.');
+  } finally {
+    done();
   }
-  done();
   if (!res.ok) {
     if (res.status === 401) throw new Error('Неверный API-ключ Claude. Проверь его в настройках.');
     if (res.status === 429) throw new Error('Слишком много запросов к Claude. Подожди минуту.');
-    const body = await res.text().catch(() => '');
-    throw new Error(`Ошибка Claude API (${res.status}): ${body.slice(0, 200)}`);
+    throw new Error(`Ошибка Claude API (${res.status}): ${raw.slice(0, 200)}`);
   }
-  const message = await res.json();
+  const message = JSON.parse(raw);
   if (message.stop_reason === 'refusal') throw new Error('Claude отказался отвечать на этот запрос.');
   const text = message.content?.find((b) => b.type === 'text')?.text;
   if (!text) throw new Error('Claude вернул пустой ответ.');
@@ -73,34 +73,86 @@ function toGeminiSchema(s) {
   return out;
 }
 
-// «latest»-псевдонимы Google сам переводит на актуальные модели; остальные — запасные,
-// если основную перегрузили (503) — у них отдельная очередь.
-const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Для быстрых задач (обзор, цены, маршрут) вторая — «лёгкая» модель: отвечает за секунды.
-const GEMINI_QUICK = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash'];
 let thinkingConfigOK = true; // если модель не понимает настройку «думай меньше» — больше не шлём
+
+// Google регулярно выпускает и убирает модели, поэтому список не зашиваем: спрашиваем у Google,
+// какие модели доступны этому ключу, и берём свежие Flash и Flash-Lite. Список помним 12 часов.
+const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+
+function modelVersion(name) {
+  const m = name.match(/gemini-(\d+(?:\.\d+)?)/);
+  return m ? Number(m[1]) : 0;
+}
+
+async function availableGeminiModels(key) {
+  try {
+    const cached = JSON.parse(localStorage.getItem('tg.geminiModels') || 'null');
+    if (cached && cached.key === key.slice(-6) && Date.now() - cached.at < 12 * 3600 * 1000) return cached.models;
+  } catch { /* нет хранилища — спросим заново */ }
+  const { signal, done } = withTimeout(null, 10000);
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key }, signal });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const models = (data.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => m.name.replace(/^models\//, ''))
+      .filter((n) => /flash/.test(n) && !/(image|tts|audio|live|embedding|exp|thinking|robotics|computer)/.test(n));
+    try { localStorage.setItem('tg.geminiModels', JSON.stringify({ key: key.slice(-6), at: Date.now(), models })); } catch { /* ок */ }
+    return models;
+  } catch {
+    return null;
+  } finally {
+    done();
+  }
+}
+
+/** Порядок моделей: для быстрых задач сначала лёгкая (Flash-Lite), для тяжёлых — обычная Flash. */
+async function geminiModels(key, quick) {
+  const list = await availableGeminiModels(key);
+  if (!list?.length) return FALLBACK_MODELS;
+  const pick = (lite) => list
+    .filter((n) => /lite/.test(n) === lite)
+    // Свежая версия лучше; стабильная лучше preview; «latest» — запасной вариант той же линейки.
+    .sort((a, b) => modelVersion(b) - modelVersion(a) || /preview/.test(a) - /preview/.test(b) || /latest/.test(a) - /latest/.test(b))
+    .slice(0, 2);
+  const flash = pick(false), lite = pick(true);
+  const order = quick ? [lite[0], flash[0], lite[1], flash[1]] : [flash[0], lite[0], flash[1], lite[1]];
+  return [...new Set(order.filter(Boolean))].slice(0, 3);
+}
+
+/** «Думай меньше»: у Gemini 3 это уровень, у Gemini 2.5 — бюджет. */
+function lightThinking(model) {
+  return modelVersion(model) >= 3 ? { thinkingLevel: 'low' } : { thinkingBudget: 512 };
+}
 
 async function geminiRequest(key, prompt, schema, opts) {
   let lastError;
-  for (const model of opts.quick ? GEMINI_QUICK : GEMINI_MODELS) {
+  const errors = [];
+  for (const model of await geminiModels(key, opts.quick)) {
     // Перегрузка у Google обычно на секунды — пробуем модель дважды с паузой, потом следующую.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         return await geminiCall(key, model, prompt, schema, opts);
       } catch (err) {
         lastError = err;
+        errors.push(err);
         if (!err.retry) throw err;
         if (attempt === 0 && (err.status === 503 || err.status === 500)) await sleepMs(2500);
         else break;
       }
     }
   }
-  if (lastError?.status === 503 || lastError?.status === 500) {
-    throw new Error('Gemini сейчас перегружен — это на стороне Google, обычно проходит за пару минут.');
+  // Показываем самую понятную причину, а не последнюю попавшуюся.
+  const has = (st) => errors.some((e) => e.status === st);
+  if (has(429)) throw new Error('Лимит бесплатных запросов Gemini на сейчас исчерпан. Подожди минуту-другую и попробуй снова.');
+  if (has(503) || has(500)) throw new Error('Gemini сейчас перегружен — это на стороне Google, обычно проходит за пару минут.');
+  if (has('timeout')) throw new Error('Gemini слишком долго отвечает. Попробуй ещё раз через минуту.');
+  if (has(404)) {
+    try { localStorage.removeItem('tg.geminiModels'); } catch { /* ок */ }
+    throw new Error('Google сменил модели Gemini — я обновил список, нажми ещё раз.');
   }
-  if (lastError?.status === 'timeout') throw new Error('Gemini слишком долго отвечает. Попробуй ещё раз через минуту.');
   throw lastError;
 }
 
@@ -139,8 +191,9 @@ async function geminiCall(key, model, prompt, schema, opts) {
       maxOutputTokens: 32768,
     };
     // Простым задачам долгие рассуждения не нужны — ответ приходит в разы быстрее.
-    if (opts.quick && thinkingConfigOK) generationConfig.thinkingConfig = { thinkingBudget: 512 };
-    let res;
+    if (opts.quick && thinkingConfigOK) generationConfig.thinkingConfig = lightThinking(model);
+    let res, raw;
+    // Лимит времени — на весь ответ целиком, включая его скачивание, а не только до первых байт.
     const { signal, done, timedOut } = withTimeout(opts.signal, opts.quick ? 30000 : 90000);
     try {
       res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
@@ -149,15 +202,17 @@ async function geminiCall(key, model, prompt, schema, opts) {
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig }),
         signal,
       });
+      raw = await res.text();
     } catch {
-      done();
       if (opts.signal?.aborted) throw cancelled();
       if (timedOut()) throw retryable('Gemini слишком долго думает.', 'timeout');
       throw new Error('Нет связи с Gemini. Проверь интернет.');
+    } finally {
+      done();
     }
-    done();
+    const parsed = (() => { try { return JSON.parse(raw); } catch { return {}; } })();
     if (res.status === 400 && generationConfig.thinkingConfig) {
-      const body = await res.clone().json().catch(() => ({}));
+      const body = parsed;
       if (/thinking/i.test(body.error?.message || '')) {
         thinkingConfigOK = false;
         return geminiCall(key, model, prompt, schema, opts);
@@ -166,7 +221,7 @@ async function geminiCall(key, model, prompt, schema, opts) {
     if (res.status === 404) throw retryable(`Модель ${model} недоступна.`, 404);
     if (res.status === 503 || res.status === 500) throw retryable('Gemini перегружен.', res.status);
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
+      const body = parsed;
       const msg = body.error?.message || '';
       const reason = body.error?.details?.find((d) => d.reason)?.reason;
       if (reason === 'API_KEY_INVALID') throw new Error('Неверный ключ Gemini. Проверь его в настройках.');
@@ -175,7 +230,7 @@ async function geminiCall(key, model, prompt, schema, opts) {
       if (res.status === 429) throw retryable('Лимит бесплатных запросов Gemini на сейчас исчерпан. Подожди минуту-другую и попробуй снова.', 429);
       throw new Error(`Ошибка Gemini (${res.status}): ${msg.slice(0, 200)}`);
     }
-    const data = await res.json();
+    const data = parsed;
     if (data.promptFeedback?.blockReason) throw new Error('Gemini отказался отвечать на этот запрос.');
     const cand = data.candidates?.[0];
     const text = cand?.content?.parts?.filter((p) => p.text && !p.thought).map((p) => p.text).join('');
