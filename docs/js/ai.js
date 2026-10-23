@@ -423,3 +423,55 @@ export async function generateGuide(ai, place, city) {
     savedAt: new Date().toISOString(),
   };
 }
+
+// ---------- Перелёт: оценка цен ----------
+
+export async function flightEstimate(ai, { from, to, depart, back, backFrom }) {
+  const route = backFrom
+    ? `туда ${from.city} (${from.iata}) → ${to.city} (${to.iata}) ${depart}, обратно ${backFrom.city} (${backFrom.iata}) → ${from.city} (${from.iata}) ${back}`
+    : `${from.city} (${from.iata}) → ${to.city} (${to.iata}), вылет ${depart}${back ? `, обратно ${back}` : ''}`;
+  const prompt = `Оцени перелёт туда и обратно, эконом, 1 взрослый: ${route}.
+По-русски и честно, как опытный турагент:
+- priceMin, priceMax: типичный диапазон общей цены туда и обратно в долларах США для этих дат и сезона (не самые редкие акции и не бизнес-класс);
+- direct: есть ли обычно прямые рейсы;
+- duration: сколько лететь (например, «4 ч 30 мин прямым» или «7–10 ч с пересадкой»);
+- airlines: какие авиакомпании обычно летают;
+- stopovers: через какие города обычно пересадки, если прямых нет или они дорогие;
+- whenToBuy: когда лучше покупать для таких дат;
+- tips: 2–4 совета, как найти дешевле (соседние аэропорты, лоукостеры, дни недели).
+Если не уверен — давай более широкий диапазон, а не выдумывай точность.`;
+  const r = await request(ai, prompt, object({
+    priceMin: { type: 'integer' }, priceMax: { type: 'integer' }, direct: { type: 'boolean' }, duration: { type: 'string' },
+    airlines: { type: 'array', items: { type: 'string' } }, stopovers: { type: 'array', items: { type: 'string' } },
+    whenToBuy: { type: 'string' }, tips: { type: 'array', items: { type: 'string' } },
+  }));
+  return { ...r, from: from.iata, to: to.iata, depart, back, savedAt: new Date().toISOString() };
+}
+
+// ---------- Обзор страны: что смотреть, сколько дней, бюджет ----------
+
+export async function countryOverview(ai, country, home) {
+  const prompt = `Турист живёт в городе ${home} и думает поехать в страну ${country}, но почти ничего о ней не знает. Сделай короткий честный обзор по-русски:
+- summary: 2–3 предложения — чем страна интересна и для кого;
+- daysMin, daysOptimal: минимум дней, чтобы увидеть главное, и оптимально для первой поездки;
+- mustSee: 5–8 обязательных мест (город или место) — name и why (одно предложение);
+- budgetPerDay: расходы в день на одного без перелёта, в долларах США: budget (хостелы, стритфуд), mid (хорошие отели 3*, кафе), comfort (4–5*, рестораны);
+- flightFromHome: примерная цена перелёта туда-обратно из ${home} в долларах: min, max, и есть ли прямые рейсы;
+- bestSeason, avoidSeason: когда ехать лучше и когда не стоит;
+- currency: валюта и как лучше платить (карты, наличные, обмен);
+- language: язык и насколько поможет английский/русский;
+- transport: как перемещаться между городами;
+- visa: что обычно нужно знать про въезд (укажи, что правила зависят от гражданства и их надо проверить);
+- watchOut: 3–5 подводных камней (мошенничество, жара, дресс-код, праздники).`;
+  const r = await request(ai, prompt, object({
+    summary: { type: 'string' },
+    daysMin: { type: 'integer' }, daysOptimal: { type: 'integer' },
+    mustSee: { type: 'array', items: object({ name: { type: 'string' }, why: { type: 'string' } }) },
+    budgetPerDay: object({ budget: { type: 'integer' }, mid: { type: 'integer' }, comfort: { type: 'integer' } }),
+    flightFromHome: object({ min: { type: 'integer' }, max: { type: 'integer' }, direct: { type: 'boolean' } }),
+    bestSeason: { type: 'string' }, avoidSeason: { type: 'string' },
+    currency: { type: 'string' }, language: { type: 'string' }, transport: { type: 'string' }, visa: { type: 'string' },
+    watchOut: { type: 'array', items: { type: 'string' } },
+  }));
+  return { ...r, country, home, savedAt: new Date().toISOString() };
+}

@@ -1,11 +1,11 @@
 // Офлайн для веб-версии (iPhone): само приложение кэшируется при первом открытии.
 // Тайлы карты кэширует map.js, здесь — только файлы приложения.
-const VERSION = 'tg-app-2026.10.20-1612';
+const VERSION = 'tg-app-2026.10.23-1718';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'vendor/maplibre-gl.js', 'vendor/maplibre-gl.css',
   'js/app.js', 'js/store.js', 'js/geo.js', 'js/planner.js', 'js/places.js',
-  'js/ai.js', 'js/suggest.js', 'js/map.js', 'js/platform.js', 'js/data-budapest.js',
+  'js/ai.js', 'js/suggest.js', 'js/flights.js', 'js/map.js', 'js/platform.js', 'js/data-budapest.js',
   'icons/icon-192.png', 'icons/apple-touch-icon.png', 'version.json',
 ];
 

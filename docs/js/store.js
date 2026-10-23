@@ -30,6 +30,8 @@ export const store = {
   offline: read('tg.offline', {}), // id поездки -> { tiles, date }
   autoCheckin: read('tg.autoCheckin', false),
   guides: read('tg.guides', {}), // id места -> скачанный гид (работает без интернета)
+  /** Откуда обычно летаем — для подбора билетов. */
+  home: read('tg.home', { name: 'Тель-Авив', lat: 32.0809, lon: 34.7806, cc: 'IL' }),
 
   subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
 
@@ -81,6 +83,12 @@ export const store = {
   saveGuide(placeId, guide) {
     this.guides[placeId] = guide;
     write('tg.guides', this.guides);
+    notify();
+  },
+
+  setHome(home) {
+    this.home = home;
+    write('tg.home', home);
     notify();
   },
 

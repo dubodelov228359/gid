@@ -1,9 +1,10 @@
 import { store } from './store.js';
-import { CATEGORIES, isClosed, distance, formatDistance, walkingMinutes, humanDay, today, daysBetween, weekdayShort } from './geo.js';
+import { CATEGORIES, isClosed, distance, formatDistance, walkingMinutes, humanDay, today, daysBetween, weekdayShort, addDays } from './geo.js';
 import { makePlan, ticketReminders } from './planner.js';
 import * as Places from './places.js';
 import * as AI from './ai.js';
 import * as Suggest from './suggest.js';
+import * as Flights from './flights.js';
 import { createMap, addPins, fitTo, userDot, drawRoute, bboxAround, downloadOffline } from './map.js';
 import { startLocation, onLocation, position, directionsTo, directionsRoute, remind, openExternal, isAndroidApp, speak, stopSpeaking, backgroundCheckin } from './platform.js';
 
@@ -20,6 +21,8 @@ const distTo = (p) => (here() ? distance(here().lat, here().lon, p.lat, p.lon) :
 // ---------- Всплывашки и модальные окна ----------
 
 function toast(text, action) {
+  // Одна всплывашка за раз — новая заменяет старую, а не ложится поверх.
+  document.querySelectorAll('.toast').forEach((t) => t.remove());
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = text;
@@ -377,6 +380,7 @@ function HomeScreen() {
     const pct = places.length ? Math.round((done / places.length) * 100) : 0;
     return `
       <a class="card trip" href="#/trip/${t.id}/map">
+        <button class="card-del" data-del-trip="${t.id}" aria-label="Удалить поездку">🗑</button>
         <div class="trip-title">${esc(t.title)}</div>
         <div class="muted">${t.stops.map((s) => esc(s.name)).join(' → ')}</div>
         <div class="trip-meta"><span>${humanDay(t.startDate, false)} · ${days} дн.</span><span>${done}/${places.length} мест</span></div>
@@ -404,6 +408,16 @@ function HomeScreen() {
       root = el;
       render();
       root.onclick = (e) => {
+        const del = e.target.closest('[data-del-trip]');
+        if (del) {
+          e.preventDefault();
+          const trip = store.trip(del.dataset.delTrip);
+          if (trip && confirm(`Удалить поездку «${trip.title}»?`)) {
+            store.deleteTrip(trip.id);
+            toast(`Поездка «${trip.title}» удалена`, { label: 'Вернуть', run: () => store.saveTrip(trip) });
+          }
+          return;
+        }
         const act = e.target.closest('[data-act]')?.dataset.act;
         if (act === 'new') openNewTrip();
         if (act === 'settings') openSettings();
@@ -609,6 +623,7 @@ function PlanTab(trip) {
           ${guideProgress[i] ? `<div class="guides-progress">${guideProgress[i]}</div>` : ''}
         </section>`;
       }).join('')}
+      ${t.countryInfo ? `<details class="day ov-details"><summary><b>🧭 О стране: дни, бюджет, что смотреть</b></summary>${overviewHTML(t.countryInfo)}</details>` : ''}
       ${t.transportTips?.length ? `<section class="day"><div class="day-head"><b>Переезды между городами</b></div><ul class="tips">${t.transportTips.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></section>` : ''}
       ${t.tips?.length ? `<section class="day"><div class="day-head"><b>Советы</b></div><ul class="tips">${t.tips.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></section>` : ''}
       <button class="btn block" data-act="replan" ${busy ? 'disabled' : ''}>${busy ? `<span class="spinner"></span> Пересобираю…${store.ai() ? ' ИИ обычно думает до 1,5 минуты' : ''}` : '↻ Пересобрать план без посещённых мест'}</button>
@@ -707,14 +722,102 @@ function TicketsView(trip) {
       </div>`).join('')}`;
 }
 
+// ---------- Перелёт ----------
+
+const usd = (n) => `$${Math.round(n).toLocaleString('ru-RU')}`;
+
+/** Даты и аэропорты перелёта для поездки: из дома в первый город, обратно — из последнего. */
+async function flightRoute(trip) {
+  const first = trip.stops[0], last = trip.stops[trip.stops.length - 1];
+  const days = trip.stops.reduce((n, st) => n + st.days, 0);
+  const [from, to, back] = await Promise.all([
+    Flights.nearestAirport(store.home.lat, store.home.lon),
+    Flights.nearestAirport(first.lat, first.lon),
+    Flights.nearestAirport(last.lat, last.lon),
+  ]);
+  return { from, to, back, depart: trip.startDate, ret: addDays(trip.startDate, days) };
+}
+
+function flightCard(trip, r, state) {
+  const est = trip.flight;
+  const fresh = est && est.from === r.from?.iata && est.to === r.to?.iata && est.depart === r.depart;
+  if (!r.from || !r.to) return '<div class="card"><b>✈️ Перелёт</b><p class="muted small">Не нашёл аэропорт рядом с городом.</p></div>';
+  if (r.from.iata === r.to.iata) return '';
+  const openJaw = r.back && r.back.iata !== r.to.iata;
+  const links = openJaw
+    ? [...Flights.searchLinks(r.from, r.to, r.depart).map((l) => ({ ...l, title: `Туда: ${l.title}` })),
+       ...Flights.searchLinks(r.back, r.from, r.ret).map((l) => ({ ...l, title: `Обратно: ${l.title}` }))]
+    : Flights.searchLinks(r.from, r.to, r.depart, r.ret);
+  return `
+    <div class="card flight">
+      <div class="ticket-head"><b>✈️ Перелёт</b><span class="muted small">≈ ${Flights.flightHours(r.from, r.to)} ч в воздухе по прямой</span></div>
+      <div class="flight-route">
+        <div><b>${r.from.iata}</b><span>${esc(store.home.name)}${r.from.airportNote ? ` · ${r.from.airportNote}` : ''}</span></div>
+        <div class="flight-line">${openJaw ? '→' : '⇄'}</div>
+        <div><b>${r.to.iata}</b><span>${esc(trip.stops[0].name)}${r.to.airportNote ? ` · ${r.to.airportNote}` : r.to.km > 30 ? ` · ${r.to.km} км до города` : ''}</span></div>
+      </div>
+      ${openJaw ? `<p class="muted small">Обратно — из ${r.back.iata} (${esc(trip.stops[trip.stops.length - 1].name)}), там заканчивается маршрут.</p>` : ''}
+      <p class="muted small">${humanDay(r.depart, false)} — ${humanDay(r.ret, false)} · 1 взрослый, эконом</p>
+      ${fresh ? `
+        <div class="price">${usd(est.priceMin)} – ${usd(est.priceMax)} <span class="muted small">туда-обратно</span></div>
+        <div class="facts small">
+          <div>${est.direct ? '✅ Обычно есть прямые рейсы' : '🔁 Обычно с пересадкой'}${est.duration ? ` · ${esc(est.duration)}` : ''}</div>
+          ${est.airlines?.length ? `<div>🛫 ${esc(est.airlines.join(', '))}</div>` : ''}
+          ${est.stopovers?.length ? `<div>↪︎ Пересадки: ${esc(est.stopovers.join(', '))}</div>` : ''}
+          ${est.whenToBuy ? `<div>🗓 ${esc(est.whenToBuy)}</div>` : ''}
+        </div>
+        ${est.tips?.length ? `<ul class="tips-inline">${est.tips.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+        <p class="muted small">⚠︎ Это оценка ИИ, а не реальные цены — точные смотри по кнопкам ниже.</p>` : store.ai() ? `
+        <button class="btn block" data-act="estimate" ${state.loading ? 'disabled' : ''}>${state.loading ? '<span class="spinner"></span> ИИ оценивает цены…' : '💰 Примерно сколько стоит?'}</button>` : `
+        <p class="muted small">Подключи ИИ в настройках ⚙︎ — подскажет примерный диапазон цен, авиакомпании и пересадки.</p>`}
+      ${state.error ? `<p class="error small">${esc(state.error)}</p>` : ''}
+      <div class="link-grid">${links.map((l, i) => `<button class="btn" data-flink="${i}">${esc(l.title)}</button>`).join('')}</div>
+      <p class="muted small">Город вылета меняется в настройках ⚙︎.</p>
+    </div>`;
+}
+
 function TicketsTab(trip) {
-  let root;
-  const render = () => keepScroll(root, () => { root.innerHTML = `<div class="scroll pad">${TicketsView(trip)}</div>`; });
+  let root, route = null, alive = true;
+  const state = { loading: false, error: '' };
+  const links = () => {
+    if (!route?.from || !route?.to) return [];
+    const openJaw = route.back && route.back.iata !== route.to.iata;
+    return openJaw ? [...Flights.searchLinks(route.from, route.to, route.depart), ...Flights.searchLinks(route.back, route.from, route.ret)]
+      : Flights.searchLinks(route.from, route.to, route.depart, route.ret);
+  };
+  const render = () => {
+    if (!alive) return;
+    keepScroll(root, () => {
+      root.innerHTML = `<div class="scroll pad">
+        ${route ? flightCard(trip(), route, state) : '<div class="card"><b>✈️ Перелёт</b><p class="muted small"><span class="spinner"></span> Ищу аэропорты…</p></div>'}
+        <div class="section-title">Билеты в музеи и бронь</div>
+        ${TicketsView(trip)}
+      </div>`;
+    });
+  };
   return {
     mount(el) {
       root = el;
       render();
-      el.onclick = (e) => {
+      flightRoute(trip()).then((r) => { route = r; render(); }).catch(() => { route = {}; render(); });
+      el.onclick = async (e) => {
+        const fl = e.target.closest('[data-flink]');
+        if (fl) { openExternal(links()[Number(fl.dataset.flink)].url); return; }
+        if (e.target.closest('[data-act=estimate]')) {
+          state.loading = true; state.error = ''; render();
+          try {
+            const est = await AI.flightEstimate(store.ai(), {
+              from: { iata: route.from.iata, city: store.home.name }, to: { iata: route.to.iata, city: trip().stops[0].name },
+              depart: route.depart, back: route.ret,
+              backFrom: route.back && route.back.iata !== route.to.iata ? { iata: route.back.iata, city: trip().stops[trip().stops.length - 1].name } : null,
+            });
+            store.saveTrip({ ...trip(), flight: est });
+          } catch (err) {
+            state.error = err.message;
+          }
+          state.loading = false; render();
+          return;
+        }
         const reminders = ticketReminders(trip()).filter((r) => !store.isVisited(r.place.id));
         const site = e.target.closest('[data-site]');
         if (site) openExternal(reminders[Number(site.dataset.site)].place.url);
@@ -732,6 +835,7 @@ function TicketsTab(trip) {
       };
     },
     update: render,
+    unmount() { alive = false; },
   };
 }
 
@@ -908,10 +1012,46 @@ function progressCard(sheet) {
   };
 }
 
+/** Обзор страны: сколько дней, что смотреть, бюджет, сезон и подводные камни. */
+function overviewHTML(o, { daysButton = false } = {}) {
+  const b = o.budgetPerDay || {};
+  const fl = o.flightFromHome || {};
+  const total = (perDay) => usd(perDay * o.daysOptimal + ((fl.min + fl.max) / 2 || 0));
+  return `<div class="card overview">
+    <b>🧭 ${esc(o.country)} — коротко</b>
+    <p>${esc(o.summary)}</p>
+    <div class="ov-grid">
+      <div><span>Сколько дней</span><b>${o.daysMin}–${o.daysOptimal}</b><small>минимум — оптимально</small></div>
+      <div><span>Перелёт из ${esc(o.home)}</span><b>${fl.min ? `${usd(fl.min)}–${usd(fl.max)}` : '—'}</b><small>${fl.direct ? 'есть прямые' : 'с пересадкой'}</small></div>
+    </div>
+    ${daysButton ? `<button class="btn block" data-takedays="${o.daysOptimal}">Взять ${o.daysOptimal} дн.</button>` : ''}
+    <div class="label">Обязательно посмотреть</div>
+    <ul class="tips-inline">${(o.mustSee || []).map((m) => `<li><b>${esc(m.name)}</b> — ${esc(m.why)}</li>`).join('')}</ul>
+    <div class="label">Бюджет в день на человека (без перелёта)</div>
+    <div class="ov-grid three">
+      <div><span>Эконом</span><b>${usd(b.budget)}</b></div>
+      <div><span>Средний</span><b>${usd(b.mid)}</b></div>
+      <div><span>Комфорт</span><b>${usd(b.comfort)}</b></div>
+    </div>
+    <p class="muted small">Вся поездка на ${o.daysOptimal} дн. с перелётом: эконом ≈ ${total(b.budget)}, средний ≈ ${total(b.mid)}, комфорт ≈ ${total(b.comfort)}.</p>
+    <div class="facts small">
+      <div>☀️ Лучше ехать: ${esc(o.bestSeason)}</div>
+      ${o.avoidSeason ? `<div>🚫 Не стоит: ${esc(o.avoidSeason)}</div>` : ''}
+      <div>💵 ${esc(o.currency)}</div>
+      <div>🗣 ${esc(o.language)}</div>
+      <div>🚆 ${esc(o.transport)}</div>
+      <div>🛂 ${esc(o.visa)}</div>
+    </div>
+    ${o.watchOut?.length ? `<div class="label">Подводные камни</div><ul class="tips-inline">${o.watchOut.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+    <p class="muted small">⚠︎ Оценка ИИ: цены и правила въезда проверяй перед поездкой.</p>
+  </div>`;
+}
+
 function openNewTrip() {
   let mode = 'single'; // single | multi | country
   let stops = [{ name: 'Будапешт', days: 5 }];
   let country = '', countryCC = '', countryDays = 10, countryName = '', transportTips = [];
+  let overview = null, overviewBusy = false, overviewError = '';
   const acResults = {}; // поле -> текущие подсказки
   let startDate = today();
   const ai = store.ai();
@@ -963,6 +1103,11 @@ function openNewTrip() {
             ${countryCC ? '<span class="ok" title="Страна найдена">✓</span>' : ''}
           </div>
           <div class="ac" data-ac="country"></div>
+          ${overview && overview.country === country.trim() ? overviewHTML(overview, { daysButton: true }) : country.trim() ? `
+            <button class="btn block" data-act="overview" ${overviewBusy ? 'disabled' : ''}>${overviewBusy
+              ? '<span class="spinner"></span> Собираю обзор… обычно 15–30 секунд'
+              : `🔍 Что есть в стране? Сколько дней и денег?`}</button>
+            ${overviewError ? `<p class="error small">${esc(overviewError)}</p>` : ''}` : ''}
           <label class="label">Сколько дней всего</label>
           <div class="stepper wide">
             <button data-cdec aria-label="Меньше">−</button>
@@ -1054,6 +1199,7 @@ function openNewTrip() {
         plan: [],
         tips: [],
         transportTips,
+        countryInfo: countryName && overview?.country === countryName ? overview : undefined,
         createdAt: new Date().toISOString(),
       };
       pc.next(withAI ? 'ИИ составляет план по дням…' : 'Составляю план по дням', withAI ? 'обычно 30–90 секунд' : '');
@@ -1119,9 +1265,22 @@ function openNewTrip() {
       render();
     }
     if (d.mapsearch) mapSearch(d.mapsearch);
+    if (d.act === 'overview') loadOverview();
+    if (d.takedays) { countryDays = Number(d.takedays); render(); }
     if (d.act === 'suggest') suggest();
     if (d.act === 'create') create();
   });
+
+  async function loadOverview() {
+    if (!ai) { overviewError = 'Обзор страны готовит ИИ — подключи его в настройках ⚙︎ (Gemini бесплатно).'; render(); return; }
+    overviewBusy = true; overviewError = ''; render();
+    try {
+      overview = await AI.countryOverview(ai, country.trim(), store.home.name);
+    } catch (err) {
+      overviewError = err.message;
+    }
+    overviewBusy = false; render();
+  }
 
   // ---------- Подсказки ----------
 
@@ -1167,6 +1326,8 @@ function openNewTrip() {
 function openSettings() {
   let provider = store.aiProvider;
   let auto = store.autoCheckin;
+  let home = { ...store.home };
+  let homeHits = [];
   const keys = { ...store.aiKeys };
   const sheet = openModal('');
   const render = () => {
@@ -1195,6 +1356,13 @@ function openSettings() {
           </div>` : `
           <p class="muted small">Ключ создаётся на <a href="#" data-link="${info.keyUrl}">platform.claude.com</a>, оплата отдельно от подписки Claude Pro. Одна поездка — примерно 10–30 центов.</p>`}
         <p class="muted small">Ключ хранится только на этом телефоне.</p>`}
+      <label class="label">Откуда летаю</label>
+      <div class="ac-field">
+        <input class="input picked" data-home value="${esc(home.name)}" placeholder="Город вылета" autocomplete="off" spellcheck="false">
+        <span class="ok">✓</span>
+      </div>
+      <div class="ac" data-ac="home"></div>
+      <p class="muted small">Для подбора билетов: из ближайшего аэропорта этого города.</p>
       <label class="label">Автоотметка</label>
       <label class="switch">
         <input type="checkbox" data-auto ${auto ? 'checked' : ''}>
@@ -1220,8 +1388,25 @@ function openSettings() {
   sheet.addEventListener('input', (e) => {
     if (e.target.dataset.key != null) keys[provider] = e.target.value;
     if (e.target.dataset.auto != null) auto = e.target.checked;
+    if (e.target.dataset.home != null) {
+      e.target.classList.remove('picked');
+      e.target.nextElementSibling?.remove();
+      const text = e.target.value;
+      Suggest.searchCities(text).then((hits) => {
+        if (e.target.value !== text) return;
+        homeHits = hits;
+        $('[data-ac="home"]', sheet).innerHTML = hits.map((h, i) => `<button class="ac-item" data-homepick="${i}"><b>${esc(h.name)}</b><span>${esc(h.sub)}</span></button>`).join('');
+      }).catch(() => {});
+    }
   });
   sheet.addEventListener('click', (e) => {
+    const hp = e.target.closest('[data-homepick]');
+    if (hp) {
+      const h = homeHits[Number(hp.dataset.homepick)];
+      home = { name: h.name, lat: h.lat, lon: h.lon, cc: h.cc };
+      render();
+      return;
+    }
     const p = e.target.closest('[data-p]')?.dataset.p;
     if (p) { provider = p; render(); return; }
     const link = e.target.closest('[data-link]');
@@ -1229,6 +1414,7 @@ function openSettings() {
     if (e.target.closest('[data-act=save]')) {
       if (provider !== 'none' && !(keys[provider] || '').trim()) { toast('Вставь ключ или выбери «Без ИИ»'); return; }
       store.setAI(provider, keys[provider] || '');
+      if (home.name !== store.home.name) store.setHome(home);
       if (auto !== store.autoCheckin) {
         store.setAutoCheckin(auto);
         if (auto) startLocation();

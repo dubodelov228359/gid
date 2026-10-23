@@ -88,3 +88,9 @@ export async function searchOnMap(query, cc) {
       lat: Number(h.lat), lon: Number(h.lon),
     }));
 }
+
+/** Столица страны из встроенного списка (для подбора главного аэропорта). */
+export async function capitalOf(cc) {
+  const list = await loadCities();
+  return list.find((c) => c.cc === cc && c.cap) || list.find((c) => c.cc === cc) || null;
+}
