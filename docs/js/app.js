@@ -397,6 +397,12 @@ function HomeScreen() {
           <div class="hero-icon">🔥</div>
           <div><b>Куда полететь</b><div class="muted small">Где сейчас сезон и недорогие билеты — с бюджетом на всю поездку</div></div>
         </a>
+        <button class="card hero as-button" data-act="countries">
+          <div class="hero-icon">🌍</div>
+          <div><b>Где я был</b><div class="muted small">${store.visitedCountries.length
+            ? `${store.visitedCountries.length} ${plural(store.visitedCountries.length, 'страна', 'страны', 'стран')} из 195 · ${store.visitedCountries.slice(0, 6).map((c) => flag(c.cc)).join(' ')}`
+            : 'Отметь страны, где уже был, — «Куда полететь» будет предлагать новые'}</div></div>
+        </button>
         <a class="card hero" href="#/explore">
           <div class="hero-icon">📍</div>
           <div><b>Что рядом со мной</b><div class="muted small">Интересные места вокруг, без всяких планов</div></div>
@@ -424,6 +430,7 @@ function HomeScreen() {
         }
         const act = e.target.closest('[data-act]')?.dataset.act;
         if (act === 'new') openNewTrip();
+        if (act === 'countries') openVisitedCountries();
         if (act === 'settings') openSettings();
       };
     },
@@ -1557,6 +1564,52 @@ function ExploreScreen() {
   };
 }
 
+const plural = (n, one, few, many) => {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+};
+
+/** «Где я был»: страны с подсказками при вводе, нажатие на страну в списке — убрать. */
+function openVisitedCountries() {
+  let hits = [];
+  const sheet = openModal('', { full: true });
+  const render = () => {
+    const list = store.visitedCountries;
+    sheet.innerHTML = `
+      <div class="sheet-bar"><span style="width:60px"></span><b>Где я был</b><button class="btn link strong" data-act="close">Готово</button></div>
+      <div class="scroll form">
+        <div class="big-count">${list.length} <span>${plural(list.length, 'страна', 'страны', 'стран')} из 195</span></div>
+        <div class="progress"><div style="width:${Math.min(100, (list.length / 195) * 100)}%"></div></div>
+        <label class="label">Добавить страну</label>
+        <input class="input" data-cq placeholder="Начни писать: Турция, Грузия…" autocomplete="off" spellcheck="false">
+        <div class="ac" data-ac="cq"></div>
+        <div class="country-chips">${list.map((c) => `<button class="chip on" data-rm="${c.cc}">${flag(c.cc)} ${esc(c.name)} ✕</button>`).join('')}</div>
+        ${list.length ? '<p class="muted small">Нажми на страну, чтобы убрать её.</p>' : ''}
+      </div>`;
+  };
+  render();
+  sheet.addEventListener('input', async (e) => {
+    if (e.target.dataset.cq == null) return;
+    const text = e.target.value;
+    hits = text.trim() ? await Suggest.searchCountries(text) : [];
+    if (e.target.value !== text) return;
+    const have = new Set(store.visitedCountries.map((c) => c.cc));
+    $('[data-ac="cq"]', sheet).innerHTML = hits.map((h, i) => `<button class="ac-item" data-add="${i}"><b>${flag(h.cc)} ${esc(h.name)}${have.has(h.cc) ? ' ✓' : ''}</b><span>${esc(h.sub)}</span></button>`).join('');
+  });
+  sheet.addEventListener('click', (e) => {
+    const t = e.target.closest('button');
+    if (!t) return;
+    if (t.dataset.act === 'close') { closeModal(); return; }
+    if (t.dataset.add) {
+      const h = hits[Number(t.dataset.add)];
+      if (!store.visitedCountries.some((c) => c.cc === h.cc)) store.toggleVisitedCountry(h.cc, h.name);
+      render();
+      $('[data-cq]', sheet).focus();
+    }
+    if (t.dataset.rm) { store.toggleVisitedCountry(t.dataset.rm, ''); render(); }
+  });
+}
+
 // ---------- Куда полететь ----------
 
 const MONTHS = ['январе', 'феврале', 'марте', 'апреле', 'мае', 'июне', 'июле', 'августе', 'сентябре', 'октябре', 'ноябре', 'декабре'];
@@ -1574,8 +1627,10 @@ function dealDates(offset, days) {
 
 function DealsScreen() {
   let root, offset = 0, budget = 0, deals = null, loading = false, error = '', ctl = null, started = 0, tick = null;
+  let hideBeen = false;
+  const been = () => new Set(store.visitedCountries.map((c) => c.cc));
   const BUDGETS = [0, 800, 1500, 2500];
-  const cacheKey = () => `tg.deals.${store.home.name}.${dealDates(offset, 7).monthName}.${budget}`;
+  const cacheKey = () => `tg.deals.${store.home.name}.${dealDates(offset, 7).monthName}.${budget}.${[...been()].sort().join('')}`;
 
   const readCache = () => {
     try {
@@ -1592,7 +1647,10 @@ function DealsScreen() {
     tick = setInterval(() => { const el = root.querySelector('[data-elapsed]'); if (el) el.textContent = Math.round((Date.now() - started) / 1000); }, 1000);
     try {
       const { monthName, year } = dealDates(offset, 7);
-      deals = await AI.hotDeals(ai, { home: store.home.name, month: `${monthName} ${year}`, budgetMax: budget || null }, ctl.signal);
+      deals = await AI.hotDeals(ai, {
+        home: store.home.name, month: `${monthName} ${year}`, budgetMax: budget || null,
+        beenTo: store.visitedCountries.map((c) => c.name),
+      }, ctl.signal);
       // ИИ не всегда держит бюджет — лишнее отсекаем сами (по нижней границе итога).
       if (budget) deals = deals.filter((d) => d.flightMin + d.perDay * d.days <= budget * 1.1);
       try { localStorage.setItem(cacheKey(), JSON.stringify({ at: Date.now(), deals })); } catch { /* ок */ }
@@ -1605,12 +1663,13 @@ function DealsScreen() {
 
   const card = (d, i) => {
     const days = d.days;
+    const wasThere = been().has(d.cc);
     const stay = d.perDay * days;
     const totalMin = d.flightMin + stay, totalMax = d.flightMax + stay;
     return `<div class="card deal">
       <div class="deal-head">
         <span class="deal-flag">${flag(d.cc)}</span>
-        <div class="row-main"><b>${esc(d.title)}</b>${d.kind === 'city' && d.country !== d.title ? `<div class="muted small">${esc(d.country)}</div>` : ''}</div>
+        <div class="row-main"><b>${esc(d.title)}</b>${d.kind === 'city' && d.country !== d.title ? `<div class="muted small">${esc(d.country)}</div>` : ''}${wasThere ? '<div class="been">✓ уже был</div>' : ''}</div>
         <div class="deal-total"><b>${usd(totalMin)}–${usd(totalMax)}</b><span>вся поездка</span></div>
       </div>
       <p>${esc(d.why)}</p>
@@ -1641,11 +1700,17 @@ function DealsScreen() {
         <main class="scroll pad">
           <div class="segmented">${labels.map((l, i) => `<button class="${offset === i ? 'on' : ''}" data-offset="${i}">${l}</button>`).join('')}</div>
           <div class="chips" style="padding:10px 0">${BUDGETS.map((b) => `<button class="chip${budget === b ? ' on' : ''}" data-budget="${b}">${b ? `до ${usd(b)}` : 'Любой бюджет'}</button>`).join('')}</div>
+          ${store.visitedCountries.length ? `<label class="switch small-switch"><input type="checkbox" data-hidebeen ${hideBeen ? 'checked' : ''}><span>Скрыть страны, где уже был (${store.visitedCountries.length})</span></label>` : ''}
           <p class="muted small">Поездки в ${monthName} · вылет: ${esc(store.home.name)} (поменять — в ⚙︎). Итог = перелёт туда-обратно + отель и еда среднего уровня на человека.</p>
           ${!ai ? '<div class="empty">Подборку делает ИИ — подключи его в настройках ⚙︎ (Gemini бесплатно).</div>' : ''}
           ${loading ? `<div class="progress-card"><span class="spinner"></span><div class="row-main"><div>ИИ ищет, куда сейчас выгодно…</div><div class="muted small">обычно 10–30 секунд · прошло <span data-elapsed>0</span> с</div></div><button class="btn" data-act="cancel">Отмена</button></div>` : ''}
           ${error ? `<p class="error">${esc(error)}</p><button class="btn block" data-act="refresh">Попробовать ещё раз</button>` : ''}
-          ${deals ? deals.map(card).join('') + '<p class="muted small center">⚠︎ Цены — оценка ИИ, а не живые цены. Точные — по кнопке «Билеты».</p>' : ''}
+          ${deals ? (() => {
+            // Новые страны — выше, знакомые — в конце (или скрыты переключателем).
+            const list = deals.map((d, i) => ({ d, i, was: been().has(d.cc) })).filter((x) => !(hideBeen && x.was)).sort((a, b) => a.was - b.was);
+            return (list.length ? list.map((x) => card(x.d, x.i)).join('') : '<div class="empty">Все варианты — в странах, где ты уже был. Нажми ↻ за другими.</div>')
+              + '<p class="muted small center">⚠︎ Цены — оценка ИИ, а не живые цены. Точные — по кнопке «Билеты».</p>';
+          })() : ''}
         </main>`;
     });
   };
@@ -1654,6 +1719,7 @@ function DealsScreen() {
     mount(el) {
       root = el;
       load();
+      el.onchange = (e) => { if (e.target.dataset.hidebeen != null) { hideBeen = e.target.checked; render(); } };
       el.onclick = async (e) => {
         const t = e.target.closest('button');
         if (!t) return;

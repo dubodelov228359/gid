@@ -86,6 +86,17 @@ export const store = {
     notify();
   },
 
+  /** Страны, где уже были: [{ cc, name }] — чтобы реже предлагать их в «Куда полететь». */
+  visitedCountries: read('tg.visitedCountries', []),
+
+  toggleVisitedCountry(cc, name) {
+    const has = this.visitedCountries.some((c) => c.cc === cc);
+    this.visitedCountries = has ? this.visitedCountries.filter((c) => c.cc !== cc)
+      : [...this.visitedCountries, { cc, name }].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+    write('tg.visitedCountries', this.visitedCountries);
+    notify();
+  },
+
   setHome(home) {
     this.home = home;
     write('tg.home', home);
