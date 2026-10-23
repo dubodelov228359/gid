@@ -14,8 +14,9 @@ function object(properties) {
 
 // ---------- Claude ----------
 
-async function claudeRequest(key, prompt, schema) {
+async function claudeRequest(key, prompt, schema, opts = {}) {
   let res;
+  const { signal, done, timedOut } = withTimeout(opts.signal, opts.quick ? 90000 : 240000);
   try {
     res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -35,10 +36,15 @@ async function claudeRequest(key, prompt, schema) {
         output_config: { effort: 'medium', format: { type: 'json_schema', schema } },
         messages: [{ role: 'user', content: prompt }],
       }),
+      signal,
     });
   } catch {
+    done();
+    if (opts.signal?.aborted) throw cancelled();
+    if (timedOut()) throw new Error('Claude слишком долго отвечает. Попробуй ещё раз.');
     throw new Error('Нет связи с Claude. Проверь интернет.');
   }
+  done();
   if (!res.ok) {
     if (res.status === 401) throw new Error('Неверный API-ключ Claude. Проверь его в настройках.');
     if (res.status === 429) throw new Error('Слишком много запросов к Claude. Подожди минуту.');
@@ -72,13 +78,17 @@ function toGeminiSchema(s) {
 const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function geminiRequest(key, prompt, schema) {
+// Для быстрых задач (обзор, цены, маршрут) вторая — «лёгкая» модель: отвечает за секунды.
+const GEMINI_QUICK = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash'];
+let thinkingConfigOK = true; // если модель не понимает настройку «думай меньше» — больше не шлём
+
+async function geminiRequest(key, prompt, schema, opts) {
   let lastError;
-  for (const model of GEMINI_MODELS) {
+  for (const model of opts.quick ? GEMINI_QUICK : GEMINI_MODELS) {
     // Перегрузка у Google обычно на секунды — пробуем модель дважды с паузой, потом следующую.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await geminiCall(key, model, prompt, schema);
+        return await geminiCall(key, model, prompt, schema, opts);
       } catch (err) {
         lastError = err;
         if (!err.retry) throw err;
@@ -90,7 +100,28 @@ async function geminiRequest(key, prompt, schema) {
   if (lastError?.status === 503 || lastError?.status === 500) {
     throw new Error('Gemini сейчас перегружен — это на стороне Google, обычно проходит за пару минут.');
   }
+  if (lastError?.status === 'timeout') throw new Error('Gemini слишком долго отвечает. Попробуй ещё раз через минуту.');
   throw lastError;
+}
+
+function cancelled() {
+  const e = new Error('Отменено');
+  e.cancelled = true;
+  return e;
+}
+
+/** Ограничение по времени плюс отмена пользователем — одним сигналом. */
+function withTimeout(outer, ms) {
+  const ctl = new AbortController();
+  let fired = false;
+  const timer = setTimeout(() => { fired = true; ctl.abort(); }, ms);
+  const onAbort = () => ctl.abort();
+  outer?.addEventListener('abort', onAbort);
+  return {
+    signal: ctl.signal,
+    timedOut: () => fired,
+    done: () => { clearTimeout(timer); outer?.removeEventListener('abort', onAbort); },
+  };
 }
 
 function retryable(message, status) {
@@ -100,24 +131,37 @@ function retryable(message, status) {
   return e;
 }
 
-async function geminiCall(key, model, prompt, schema) {
+async function geminiCall(key, model, prompt, schema, opts) {
   {
+    const generationConfig = {
+      responseMimeType: 'application/json',
+      responseSchema: toGeminiSchema(schema),
+      maxOutputTokens: 32768,
+    };
+    // Простым задачам долгие рассуждения не нужны — ответ приходит в разы быстрее.
+    if (opts.quick && thinkingConfigOK) generationConfig.thinkingConfig = { thinkingBudget: 512 };
     let res;
+    const { signal, done, timedOut } = withTimeout(opts.signal, opts.quick ? 30000 : 90000);
     try {
       res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST',
         headers: { 'x-goog-api-key': key, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: toGeminiSchema(schema),
-            maxOutputTokens: 32768,
-          },
-        }),
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig }),
+        signal,
       });
     } catch {
+      done();
+      if (opts.signal?.aborted) throw cancelled();
+      if (timedOut()) throw retryable('Gemini слишком долго думает.', 'timeout');
       throw new Error('Нет связи с Gemini. Проверь интернет.');
+    }
+    done();
+    if (res.status === 400 && generationConfig.thinkingConfig) {
+      const body = await res.clone().json().catch(() => ({}));
+      if (/thinking/i.test(body.error?.message || '')) {
+        thinkingConfigOK = false;
+        return geminiCall(key, model, prompt, schema, opts);
+      }
     }
     if (res.status === 404) throw retryable(`Модель ${model} недоступна.`, 404);
     if (res.status === 503 || res.status === 500) throw retryable('Gemini перегружен.', res.status);
@@ -144,8 +188,9 @@ async function geminiCall(key, model, prompt, schema) {
   }
 }
 
-function request(ai, prompt, schema) {
-  return ai.provider === 'gemini' ? geminiRequest(ai.key, prompt, schema) : claudeRequest(ai.key, prompt, schema);
+/** opts.quick — простая задача (быстрее модель и ответ); opts.signal — отмена пользователем. */
+function request(ai, prompt, schema, opts = {}) {
+  return ai.provider === 'gemini' ? geminiRequest(ai.key, prompt, schema, opts) : claudeRequest(ai.key, prompt, schema, opts);
 }
 
 // ---------- Сверка с картой ----------
@@ -383,7 +428,7 @@ export async function suggestRoute(ai, country, totalDays) {
 - why: 1 предложение по-русски — чем это место интересно;
 - tips: 3–6 коротких советов по-русски о переездах между городами (поезд, маршрутка, аренда авто, сколько ехать).`;
   const city = object({ name: { type: 'string' }, localName: { type: 'string' }, days: { type: 'integer' }, why: { type: 'string' } });
-  const result = await request(ai, prompt, object({ cities: { type: 'array', items: city }, tips: { type: 'array', items: { type: 'string' } } }));
+  const result = await request(ai, prompt, object({ cities: { type: 'array', items: city }, tips: { type: 'array', items: { type: 'string' } } }), { quick: true });
   const cities = (result.cities || []).filter((c) => c.name).map((c) => ({ ...c, days: Math.max(1, c.days || 1) }));
   if (!cities.length) throw new Error('ИИ не смог предложить маршрут.');
   // Подгоняем сумму дней, если ИИ ошибся: разницу — первому городу.
@@ -413,7 +458,7 @@ export async function generateGuide(ai, place, city) {
     highlights: { type: 'array', items: { type: 'string' } },
     tips: { type: 'array', items: { type: 'string' } },
   });
-  const g = await request(ai, prompt, schema);
+  const g = await request(ai, prompt, schema, { quick: true });
   return {
     source: 'ai',
     intro: g.intro || '',
@@ -426,7 +471,7 @@ export async function generateGuide(ai, place, city) {
 
 // ---------- Перелёт: оценка цен ----------
 
-export async function flightEstimate(ai, { from, to, depart, back, backFrom }) {
+export async function flightEstimate(ai, { from, to, depart, back, backFrom }, signal) {
   const route = backFrom
     ? `туда ${from.city} (${from.iata}) → ${to.city} (${to.iata}) ${depart}, обратно ${backFrom.city} (${backFrom.iata}) → ${from.city} (${from.iata}) ${back}`
     : `${from.city} (${from.iata}) → ${to.city} (${to.iata}), вылет ${depart}${back ? `, обратно ${back}` : ''}`;
@@ -444,13 +489,13 @@ export async function flightEstimate(ai, { from, to, depart, back, backFrom }) {
     priceMin: { type: 'integer' }, priceMax: { type: 'integer' }, direct: { type: 'boolean' }, duration: { type: 'string' },
     airlines: { type: 'array', items: { type: 'string' } }, stopovers: { type: 'array', items: { type: 'string' } },
     whenToBuy: { type: 'string' }, tips: { type: 'array', items: { type: 'string' } },
-  }));
+  }), { quick: true, signal });
   return { ...r, from: from.iata, to: to.iata, depart, back, savedAt: new Date().toISOString() };
 }
 
 // ---------- Обзор страны: что смотреть, сколько дней, бюджет ----------
 
-export async function countryOverview(ai, country, home) {
+export async function countryOverview(ai, country, home, signal) {
   const prompt = `Турист живёт в городе ${home} и думает поехать в страну ${country}, но почти ничего о ней не знает. Сделай короткий честный обзор по-русски:
 - summary: 2–3 предложения — чем страна интересна и для кого;
 - daysMin, daysOptimal: минимум дней, чтобы увидеть главное, и оптимально для первой поездки;
@@ -472,6 +517,6 @@ export async function countryOverview(ai, country, home) {
     bestSeason: { type: 'string' }, avoidSeason: { type: 'string' },
     currency: { type: 'string' }, language: { type: 'string' }, transport: { type: 'string' }, visa: { type: 'string' },
     watchOut: { type: 'array', items: { type: 'string' } },
-  }));
+  }), { quick: true, signal });
   return { ...r, country, home, savedAt: new Date().toISOString() };
 }

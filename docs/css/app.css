@@ -355,3 +355,4 @@ a { color: var(--accent); }
 .ov-grid small { font-size: 11px; color: var(--muted); }
 .ov-details summary { cursor: pointer; padding: 10px 4px; }
 .ov-details .card { margin-top: 6px; }
+.progress-card .btn { flex: none; padding: 8px 12px; }

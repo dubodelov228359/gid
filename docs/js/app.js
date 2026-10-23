@@ -768,7 +768,10 @@ function flightCard(trip, r, state) {
         </div>
         ${est.tips?.length ? `<ul class="tips-inline">${est.tips.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
         <p class="muted small">⚠︎ Это оценка ИИ, а не реальные цены — точные смотри по кнопкам ниже.</p>` : store.ai() ? `
-        <button class="btn block" data-act="estimate" ${state.loading ? 'disabled' : ''}>${state.loading ? '<span class="spinner"></span> ИИ оценивает цены…' : '💰 Примерно сколько стоит?'}</button>` : `
+        ${state.loading ? `<div class="progress-card"><span class="spinner"></span>
+          <div class="row-main"><div>ИИ оценивает цены…</div><div class="muted small">обычно 10–30 секунд · прошло <span data-elapsed>0</span> с</div></div>
+          <button class="btn" data-act="estcancel">Отмена</button></div>`
+          : '<button class="btn block" data-act="estimate">💰 Примерно сколько стоит?</button>'}` : `
         <p class="muted small">Подключи ИИ в настройках ⚙︎ — подскажет примерный диапазон цен, авиакомпании и пересадки.</p>`}
       ${state.error ? `<p class="error small">${esc(state.error)}</p>` : ''}
       <div class="link-grid">${links.map((l, i) => `<button class="btn" data-flink="${i}">${esc(l.title)}</button>`).join('')}</div>
@@ -803,18 +806,25 @@ function TicketsTab(trip) {
       el.onclick = async (e) => {
         const fl = e.target.closest('[data-flink]');
         if (fl) { openExternal(links()[Number(fl.dataset.flink)].url); return; }
+        if (e.target.closest('[data-act=estcancel]')) { state.ctl?.abort(); return; }
         if (e.target.closest('[data-act=estimate]')) {
-          state.loading = true; state.error = ''; render();
+          state.loading = true; state.error = ''; state.ctl = new AbortController(); render();
+          const started = Date.now();
+          const tick = setInterval(() => {
+            const el = root.querySelector('[data-elapsed]');
+            if (el) el.textContent = Math.round((Date.now() - started) / 1000);
+          }, 1000);
           try {
             const est = await AI.flightEstimate(store.ai(), {
               from: { iata: route.from.iata, city: store.home.name }, to: { iata: route.to.iata, city: trip().stops[0].name },
               depart: route.depart, back: route.ret,
               backFrom: route.back && route.back.iata !== route.to.iata ? { iata: route.back.iata, city: trip().stops[trip().stops.length - 1].name } : null,
-            });
+            }, state.ctl.signal);
             store.saveTrip({ ...trip(), flight: est });
           } catch (err) {
-            state.error = err.message;
+            state.error = err.cancelled ? '' : err.message;
           }
+          clearInterval(tick);
           state.loading = false; render();
           return;
         }
@@ -1051,7 +1061,7 @@ function openNewTrip() {
   let mode = 'single'; // single | multi | country
   let stops = [{ name: 'Будапешт', days: 5 }];
   let country = '', countryCC = '', countryDays = 10, countryName = '', transportTips = [];
-  let overview = null, overviewBusy = false, overviewError = '';
+  let overview = null, overviewBusy = false, overviewError = '', overviewCtl = null, overviewStarted = 0;
   const acResults = {}; // поле -> текущие подсказки
   let startDate = today();
   const ai = store.ai();
@@ -1104,9 +1114,10 @@ function openNewTrip() {
           </div>
           <div class="ac" data-ac="country"></div>
           ${overview && overview.country === country.trim() ? overviewHTML(overview, { daysButton: true }) : country.trim() ? `
-            <button class="btn block" data-act="overview" ${overviewBusy ? 'disabled' : ''}>${overviewBusy
-              ? '<span class="spinner"></span> Собираю обзор… обычно 15–30 секунд'
-              : `🔍 Что есть в стране? Сколько дней и денег?`}</button>
+            ${overviewBusy ? `<div class="progress-card"><span class="spinner"></span>
+              <div class="row-main"><div>ИИ собирает обзор страны…</div><div class="muted small">обычно 10–30 секунд · прошло <span data-elapsed>0</span> с</div></div>
+              <button class="btn" data-act="ovcancel">Отмена</button></div>`
+              : '<button class="btn block" data-act="overview">🔍 Что есть в стране? Сколько дней и денег?</button>'}
             ${overviewError ? `<p class="error small">${esc(overviewError)}</p>` : ''}` : ''}
           <label class="label">Сколько дней всего</label>
           <div class="stepper wide">
@@ -1266,6 +1277,7 @@ function openNewTrip() {
     }
     if (d.mapsearch) mapSearch(d.mapsearch);
     if (d.act === 'overview') loadOverview();
+    if (d.act === 'ovcancel') overviewCtl?.abort();
     if (d.takedays) { countryDays = Number(d.takedays); render(); }
     if (d.act === 'suggest') suggest();
     if (d.act === 'create') create();
@@ -1273,12 +1285,17 @@ function openNewTrip() {
 
   async function loadOverview() {
     if (!ai) { overviewError = 'Обзор страны готовит ИИ — подключи его в настройках ⚙︎ (Gemini бесплатно).'; render(); return; }
-    overviewBusy = true; overviewError = ''; render();
+    overviewBusy = true; overviewError = ''; overviewCtl = new AbortController(); overviewStarted = Date.now(); render();
+    const tick = setInterval(() => {
+      const el = $('[data-elapsed]', sheet);
+      if (el) el.textContent = Math.round((Date.now() - overviewStarted) / 1000);
+    }, 1000);
     try {
-      overview = await AI.countryOverview(ai, country.trim(), store.home.name);
+      overview = await AI.countryOverview(ai, country.trim(), store.home.name, overviewCtl.signal);
     } catch (err) {
-      overviewError = err.message;
+      overviewError = err.cancelled ? '' : err.message;
     }
+    clearInterval(tick);
     overviewBusy = false; render();
   }
 
